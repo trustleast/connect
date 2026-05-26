@@ -96,7 +96,8 @@ type Client struct {
 }
 
 type connState struct {
-	pc *webrtc.PeerConnection
+	pc         *webrtc.PeerConnection
+	releaseICE func()
 
 	mu       sync.RWMutex
 	offerSdp string
@@ -157,12 +158,12 @@ func (c *Client) Dial(ctx context.Context, remotePubkey string) (*webrtc.PeerCon
 		return nil, fmt.Errorf("generating challenge: %w", err)
 	}
 
-	pc, err := c.makePC(ctx, remotePubkey, challenge)
+	pc, releaseICE, err := c.makePC(ctx, remotePubkey, challenge)
 	if err != nil {
 		return nil, err
 	}
 
-	state := &connState{pc: pc}
+	state := &connState{pc: pc, releaseICE: releaseICE}
 	c.conns.Store(makeConnKey(remotePubkey, challenge), state)
 
 	pc.OnNegotiationNeeded(func() {
@@ -191,10 +192,34 @@ func (c *Client) Close() {
 // ctx governs all ICE candidate HTTP sends for this connection.
 // makePC creates a new PeerConnection and wires ICE candidate signing.
 // The caller is responsible for storing it in c.conns.
-func (c *Client) makePC(ctx context.Context, remotePubkey string, challenge []byte) (*webrtc.PeerConnection, error) {
+func (c *Client) makePC(ctx context.Context, remotePubkey string, challenge []byte) (*webrtc.PeerConnection, func(), error) {
 	pc, err := c.api.NewPeerConnection(c.opts.Configuration)
 	if err != nil {
-		return nil, fmt.Errorf("creating peer connection: %w", err)
+		return nil, nil, fmt.Errorf("creating peer connection: %w", err)
+	}
+
+	var iceMu sync.Mutex
+	iceReleased := false
+	var pendingICE []string
+
+	sendICE := func(candidateJSON string) {
+		_ = c.postICE(ctx, remotePubkey, candidateJSON, challenge)
+	}
+
+	releaseICE := func() {
+		iceMu.Lock()
+		if iceReleased {
+			iceMu.Unlock()
+			return
+		}
+		iceReleased = true
+		pending := append([]string(nil), pendingICE...)
+		pendingICE = nil
+		iceMu.Unlock()
+
+		for _, candidateJSON := range pending {
+			sendICE(candidateJSON)
+		}
 	}
 
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
@@ -205,10 +230,20 @@ func (c *Client) makePC(ctx context.Context, remotePubkey string, challenge []by
 		if err != nil {
 			return
 		}
-		_ = c.postICE(ctx, remotePubkey, string(b), challenge)
+		candidateJSON := string(b)
+
+		iceMu.Lock()
+		if !iceReleased {
+			pendingICE = append(pendingICE, candidateJSON)
+			iceMu.Unlock()
+			return
+		}
+		iceMu.Unlock()
+
+		sendICE(candidateJSON)
 	})
 
-	return pc, nil
+	return pc, releaseICE, nil
 }
 
 func (c *Client) postOffer(ctx context.Context, remotePubkey, offerSdp string, challenge, ts []byte) error {
@@ -286,7 +321,11 @@ func (c *Client) createAndSendOffer(ctx context.Context, remotePubkey string, st
 		return fmt.Errorf("no local description after creating offer")
 	}
 	state.setOfferSdp(desc.SDP)
-	return c.postOffer(ctx, remotePubkey, desc.SDP, challenge, currentTsBytes())
+	if err := c.postOffer(ctx, remotePubkey, desc.SDP, challenge, currentTsBytes()); err != nil {
+		return err
+	}
+	state.releaseICE()
+	return nil
 }
 
 // handleOffer verifies timestamp and signature (including recipient binding),
@@ -317,7 +356,7 @@ func (c *Client) handleOffer(ctx context.Context, msg wireMessage, challenge []b
 		return nil, fmt.Errorf("invalid offer signature from %s", msg.From)
 	}
 
-	pc, err := c.makePC(ctx, msg.From, challenge)
+	pc, releaseICE, err := c.makePC(ctx, msg.From, challenge)
 	if err != nil {
 		return nil, err
 	}
@@ -346,6 +385,7 @@ func (c *Client) handleOffer(ctx context.Context, msg wireMessage, challenge []b
 	if err := c.postAnswer(ctx, msg.From, desc.SDP, challenge, msg.Data); err != nil {
 		return pc, err
 	}
+	releaseICE()
 	return pc, nil
 }
 

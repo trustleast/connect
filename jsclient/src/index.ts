@@ -174,22 +174,14 @@ export class ConnectClient {
   dial(remotePublicKey: CryptoKey): RTCPeerConnection {
     const challenge = crypto.getRandomValues(new Uint8Array(32));
     const pc = new RTCPeerConnection(this.options.rtcConfiguration);
+    let releaseIce = () => {};
 
     // Key export is the only async step. onnegotiationneeded fires as a task
     // after microtasks drain, so setupPromise is always resolved first.
     const setupPromise = this.keyToString(remotePublicKey).then(
       (remotePubkey) => {
         this.sessions.set(this.sessionKey(remotePubkey, challenge), pc);
-
-        pc.onicecandidate = ({ candidate }) => {
-          if (candidate) {
-            void this.postICE(
-              remotePubkey,
-              JSON.stringify(candidate.toJSON()),
-              challenge,
-            );
-          }
-        };
+        releaseIce = this.wireIce(pc, remotePubkey, challenge);
 
         return remotePubkey;
       },
@@ -217,6 +209,7 @@ export class ConnectClient {
           ts,
           answererPubkeyBytes,
         );
+        releaseIce();
       } catch (e) {
         console.error("[signaling] offer failed:", e);
       }
@@ -254,20 +247,37 @@ export class ConnectClient {
   private makePC(
     remotePubkey: string,
     challenge: Uint8Array,
-  ): RTCPeerConnection {
+  ): [RTCPeerConnection, () => void] {
     const pc = new RTCPeerConnection(this.options.rtcConfiguration);
+    return [pc, this.wireIce(pc, remotePubkey, challenge)];
+  }
+
+  private wireIce(
+    pc: RTCPeerConnection,
+    remotePubkey: string,
+    challenge: Uint8Array,
+  ): () => void {
+    const pending: string[] = [];
+    let released = false;
 
     pc.onicecandidate = ({ candidate }) => {
-      if (candidate) {
-        void this.postICE(
-          remotePubkey,
-          JSON.stringify(candidate.toJSON()),
-          challenge,
-        );
+      if (!candidate) return;
+      const candidateJson = JSON.stringify(candidate.toJSON());
+      if (!released) {
+        pending.push(candidateJson);
+        return;
       }
+      void this.postICE(remotePubkey, candidateJson, challenge);
     };
 
-    return pc;
+    return () => {
+      if (released) return;
+      released = true;
+      for (const candidateJson of pending) {
+        void this.postICE(remotePubkey, candidateJson, challenge);
+      }
+      pending.length = 0;
+    };
   }
 
   private async postOffer(
@@ -338,6 +348,8 @@ export class ConnectClient {
   }
 
   private async dispatch(msg: WireMessage): Promise<void> {
+    console.log("Received message", msg);
+
     let challenge: Uint8Array;
     try {
       challenge = base64UrlDecode(msg.challenge);
@@ -414,7 +426,7 @@ export class ConnectClient {
       if (!accepted) return;
     }
 
-    const incoming = this.makePC(msg.from, challenge);
+    const [incoming, releaseIce] = this.makePC(msg.from, challenge);
     const key = this.sessionKey(msg.from, challenge);
     this.sessions.set(key, incoming);
 
@@ -426,6 +438,7 @@ export class ConnectClient {
       this.options.onIncoming?.(incoming, senderKey);
 
       await this.postAnswer(msg.from, answer.sdp!, challenge, msg.data);
+      releaseIce();
     } catch (e) {
       incoming.close();
       console.log("Closing because failed to set", e);
