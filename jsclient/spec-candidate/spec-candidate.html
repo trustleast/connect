@@ -1,0 +1,125 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>connect browser spec candidate</title>
+<pre id="log"></pre>
+<script type="module">
+  const logEl = document.getElementById("log");
+  const params = new URLSearchParams(location.search);
+  const serverUrl = required("server");
+  const targetPubkey = required("target");
+  const reportUrl = required("report");
+  const dialTimeoutMs = Number(params.get("dialTimeoutMs") || "10000");
+  const clientModule = params.get("client") || "/dist/index.js";
+
+  const { ConnectClient } = await import(clientModule);
+
+  const inbound = deferred();
+  const outbound = deferred();
+  let client;
+  let pc;
+
+  try {
+    await report("log", "starting browser candidate");
+    client = await ConnectClient.create({
+      serverUrl,
+      dialTimeoutMs,
+      acceptConnection: () => true,
+      onIncoming: (incoming) => {
+        log("inbound offer authenticated");
+        incoming.ondatachannel = ({ channel }) => {
+          log(`inbound data channel observed label=${channel.label}`);
+          respondToChallenge(channel, inbound);
+        };
+      },
+    });
+
+    log(`candidate pubkey=${client.pubkey}`);
+    const targetKey = await crypto.subtle.importKey(
+      "raw",
+      base64UrlDecode(targetPubkey),
+      "Ed25519",
+      true,
+      ["verify"],
+    );
+
+    log("dialing tester");
+    pc = await client.dial(targetKey, (pc) => {
+      log("installing outbound data channel listener before offer");
+      pc.createDataChannel("test");
+      pc.ondatachannel = ({ channel }) => {
+        log(`outbound data channel observed label=${channel.label}`);
+        respondToChallenge(channel, outbound);
+      };
+    });
+    log("outbound dial authenticated");
+
+    await timeout(outbound.promise, "outbound challenge timeout");
+    await timeout(inbound.promise, "inbound challenge timeout");
+    await report("ok", "browser candidate passed");
+    log("ok");
+  } catch (err) {
+    await report("fail", err?.stack || String(err));
+    throw err;
+  }
+
+  function respondToChallenge(channel, done) {
+    channel.onmessage = ({ data }) => {
+      const text = String(data).trim();
+      log(`received label=${channel.label} text=${JSON.stringify(text)}`);
+      if (!text.startsWith("challenge:")) {
+        done.reject(new Error(`unexpected challenge message: ${JSON.stringify(text)}`));
+        return;
+      }
+      channel.send(`pong:${text.slice("challenge:".length)}`);
+      log(`sent pong label=${channel.label}`);
+      done.resolve();
+    };
+  }
+
+  function required(name) {
+    const value = params.get(name);
+    if (!value) throw new Error(`missing query param: ${name}`);
+    return value;
+  }
+
+  function base64UrlDecode(s) {
+    const pad = "=".repeat((4 - (s.length % 4)) % 4);
+    const b64 = (s + pad).replace(/-/g, "+").replace(/_/g, "/");
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  function deferred() {
+    let resolve;
+    let reject;
+    const promise = new Promise((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  function timeout(promise, message) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(message)), dialTimeoutMs),
+      ),
+    ]);
+  }
+
+  function log(message) {
+    logEl.textContent += `${new Date().toISOString()} ${message}\n`;
+    void report("log", message);
+  }
+
+  async function report(status, message) {
+    await fetch(reportUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ status, message }),
+    }).catch(() => {});
+  }
+</script>

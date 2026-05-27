@@ -32,7 +32,7 @@ export interface ConnectOptions {
   acceptConnection?: (remotePublicKey: CryptoKey) => boolean | Promise<boolean>;
   /**
    * Called when an incoming offer has been verified and accepted, after
-   * setLocalDescription but before the answer is sent. Wire ondatachannel
+   * setRemoteDescription but before the answer is created. Wire ondatachannel
    * and media track handlers here. The PC may still be closed by the library
    * if a subsequent ICE candidate fails auth — "incoming" means a valid
    * authenticated offer arrived, not that a working P2P connection exists.
@@ -151,10 +151,6 @@ export class ConnectClient {
   private readonly sessions = new Map<string, RTCPeerConnection>();
   private readonly sentOffers = new Map<string, string>();
   private readonly dialSettlers = new Map<string, DialSettler>();
-  private readonly dialTimers = new Map<
-    string,
-    ReturnType<typeof setTimeout>
-  >();
   private closed = false;
   private readonly abort = new AbortController();
 
@@ -541,10 +537,11 @@ export class ConnectClient {
 
     try {
       await incoming.setRemoteDescription({ type: "offer", sdp: msg.data });
-      const answer = await incoming.createAnswer();
-      await incoming.setLocalDescription(answer);
 
       this.options.onIncoming?.(incoming, senderKey);
+
+      const answer = await incoming.createAnswer();
+      await incoming.setLocalDescription(answer);
 
       await this.postAnswer(msg.from, answer.sdp!, challenge, msg.data);
       releaseIce();

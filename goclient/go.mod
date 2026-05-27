@@ -2,10 +2,12 @@ module github.com/trustleast/connect/goclient
 
 go 1.24
 
-require github.com/pion/webrtc/v4 v4.0.0
+require (
+	github.com/google/uuid v1.6.0
+	github.com/pion/webrtc/v4 v4.0.0
+)
 
 require (
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/pion/datachannel v1.5.9 // indirect
 	github.com/pion/dtls/v3 v3.0.3 // indirect
 	github.com/pion/ice/v4 v4.0.2 // indirect

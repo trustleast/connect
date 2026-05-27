@@ -50,3 +50,15 @@ At a high level:
 Any verification failure closes the relevant `RTCPeerConnection`.
 
 Read [connection-flow.md](connection-flow.md) for the full sequence and security rationale. That document is design documentation, not an audit.
+
+## Creating New Clients
+
+New client libraries should preserve the server's dumb-pipe model: keep SDP,
+ICE, signing, session state, authorization, and cleanup semantics in the client,
+not the relay.
+
+Use [connection-flow.md](connection-flow.md) as the protocol spec, and run the
+[spec tester](goclient/cmd/spec-tester/README.md) against new implementations.
+The tester exercises both dialer and answerer behavior, checks signing and
+message ordering invariants, and verifies that an authenticated WebRTC
+connection can answer a challenge over a data channel.
