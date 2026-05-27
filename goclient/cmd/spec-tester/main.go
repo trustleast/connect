@@ -39,7 +39,6 @@ func run() error {
 	if len(candidateCmd) == 0 {
 		return fmt.Errorf("usage: spec-tester [flags] -- candidate-command [args...]")
 	}
-	logStep("starting spec tester server_url=%s timeout=%s dial_timeout=%s", *serverURL, timeout.String(), dialTimeout.String())
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
@@ -50,17 +49,17 @@ func run() error {
 		ServerURL: *serverURL,
 		OnSignal:  trace.observe,
 		AcceptConnection: func(remotePubkey string) bool {
-			logStep("accepting inbound connection from %s", shortKey(remotePubkey))
+			fmt.Fprintf(os.Stderr, "accepting inbound connection from %s\n", shortKey(remotePubkey))
 			return true
 		},
 		OnIncoming: func(pc *webrtc.PeerConnection, remotePubkey string) {
-			logStep("inbound offer accepted from %s", shortKey(remotePubkey))
+			fmt.Fprintf(os.Stderr, "inbound offer accepted from %s\n", shortKey(remotePubkey))
 			result := inboundConnection{remotePubkey: remotePubkey, done: make(chan error, 1)}
 			inboundResult <- result
 			label := uuid.New().String()
 			pc.OnConnectionStateChange(func(pcs webrtc.PeerConnectionState) {
 				if pcs == webrtc.PeerConnectionStateConnected {
-					logStep("peer connection state connected for inbound from %s", shortKey(remotePubkey))
+					fmt.Fprintf(os.Stderr, "peer connection state connected for inbound from %s\n", shortKey(remotePubkey))
 
 					dc, err := pc.CreateDataChannel(label, nil)
 					if err != nil {
@@ -77,17 +76,16 @@ func run() error {
 		return fail("spec-tester.client.create", "create spec client: %v", err)
 	}
 	defer client.Close()
-	logStep("tester pubkey=%s", client.Pubkey())
+	fmt.Fprintf(os.Stderr, "tester pubkey=%s\n", client.Pubkey())
 
 	listenErr := make(chan error, 1)
 	go func() {
-		logStep("starting listener")
 		listenErr <- client.Listen(ctx)
 	}()
 
 	candidateDone := make(chan error, 1)
 	candidateArgs := append(candidateCmd[1:], *serverURL, client.Pubkey())
-	logStep("starting candidate: %s %s", candidateCmd[0], strings.Join(candidateArgs, " "))
+	fmt.Fprintf(os.Stderr, "starting candidate: %s %s\n", candidateCmd[0], strings.Join(candidateArgs, " "))
 	cmd := exec.CommandContext(ctx, candidateCmd[0], candidateArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -99,10 +97,10 @@ func run() error {
 	}()
 
 	var inbound inboundConnection
-	logStep("waiting for candidate to dial tester")
+	fmt.Fprintf(os.Stderr, "waiting for candidate to dial tester\n")
 	select {
 	case inbound = <-inboundResult:
-		logStep("candidate dial observed from %s", shortKey(inbound.remotePubkey))
+		fmt.Fprintf(os.Stderr, "candidate dial observed from %s\n", shortKey(inbound.remotePubkey))
 	case err := <-listenErr:
 		return fail("spec-tester.listen.before-inbound", "listen failed before inbound dial: %v", err)
 	case err := <-candidateDone:
@@ -111,25 +109,25 @@ func run() error {
 		return fail("spec-tester.timeout.before-inbound", "%v", ctx.Err())
 	}
 
-	logStep("waiting for inbound-leg challenge/pong")
+	fmt.Fprintf(os.Stderr, "waiting for inbound-leg challenge/pong\n")
 	if err := waitResult(ctx, inbound.done, "connection-flow.inbound.challenge-pong"); err != nil {
 		return err
 	}
-	logStep("validating inbound-leg signaling invariants")
+	fmt.Fprintf(os.Stderr, "validating inbound-leg signaling invariants\n")
 	if err := trace.validateInboundAnswerer(client.Pubkey(), inbound.remotePubkey); err != nil {
 		return err
 	}
 
-	logStep("dialing candidate back")
+	fmt.Fprintf(os.Stderr, "dialing candidate back\n")
 	if err := dialBack(ctx, client, inbound.remotePubkey, *dialTimeout); err != nil {
 		return err
 	}
-	logStep("validating outbound-leg signaling invariants")
+	fmt.Fprintf(os.Stderr, "validating outbound-leg signaling invariants\n")
 	if err := trace.validateOutboundDialer(client.Pubkey(), inbound.remotePubkey); err != nil {
 		return err
 	}
 
-	logStep("waiting for candidate exit")
+	fmt.Fprintf(os.Stderr, "waiting for candidate exit\n")
 	select {
 	case err := <-candidateDone:
 		if err != nil {
@@ -142,8 +140,6 @@ func run() error {
 		return fail("spec-tester.timeout", "%v", ctx.Err())
 	}
 
-	logStep("spec tester passed")
-	fmt.Println("ok")
 	return nil
 }
 
@@ -180,7 +176,11 @@ func (t *signalTrace) observe(event connect.SignalEvent) {
 	raw, err := base64.RawURLEncoding.DecodeString(event.Payload)
 	ok := err == nil && json.Unmarshal(raw, &msg) == nil
 
-	fmt.Printf("[spec-tester] %s: %s\n", event.Direction, raw)
+	direction := ">"
+	if event.Direction == connect.SignalInboundSSE {
+		direction = "<"
+	}
+	fmt.Printf("%s %s\n", direction, raw)
 
 	t.mu.Lock()
 	t.events = append(t.events, observedSignal{event: event, msg: msg, ok: ok})
@@ -448,7 +448,7 @@ func dialBack(ctx context.Context, client *connect.Client, remotePubkey string, 
 				done <- err
 				return
 			}
-			logStep("creating outbound-leg tester data channel label=%s", label)
+			fmt.Fprintf(os.Stderr, "creating outbound-leg tester data channel label=%s\n", label)
 			dc, err := pc.CreateDataChannel(label, nil)
 			if err != nil {
 				done <- fail("connection-flow.outbound.datachannel.create", "create data channel: %v", err)
@@ -462,7 +462,7 @@ func dialBack(ctx context.Context, client *connect.Client, remotePubkey string, 
 	}
 	defer pc.Close()
 
-	logStep("waiting for outbound-leg challenge/pong")
+	fmt.Fprintf(os.Stderr, "waiting for outbound-leg challenge/pong\n")
 	return waitResult(ctx, done, "connection-flow.outbound.challenge-pong")
 }
 
@@ -475,7 +475,7 @@ func wireChallenge(dc *webrtc.DataChannel, done chan<- error) {
 	expected := "pong:" + challenge
 
 	dc.OnOpen(func() {
-		logStep("data channel open label=%s sending challenge=%s", dc.Label(), challenge[:12])
+		fmt.Fprintf(os.Stderr, "data channel open label=%s sending challenge=%s\n", dc.Label(), challenge[:12])
 		if err := dc.SendText("challenge:" + challenge); err != nil {
 			done <- fail("connection-flow.challenge.send", "send challenge: %v", err)
 		}
@@ -485,7 +485,7 @@ func wireChallenge(dc *webrtc.DataChannel, done chan<- error) {
 			done <- fail("connection-flow.challenge.pong", "expected %q, got %q", expected, string(msg.Data))
 			return
 		}
-		logStep("received expected pong for challenge=%s", challenge[:12])
+		fmt.Fprintf(os.Stderr, "received expected pong for challenge=%s\n", challenge[:12])
 		done <- nil
 	})
 }
@@ -521,10 +521,6 @@ func waitResult(ctx context.Context, done <-chan error, name string) error {
 
 func fail(section, format string, args ...any) error {
 	return fmt.Errorf("[%s] %s", section, fmt.Sprintf(format, args...))
-}
-
-func logStep(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "[spec-tester] %s %s\n", time.Now().Format("15:04:05.000"), fmt.Sprintf(format, args...))
 }
 
 func shortKey(key string) string {
