@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -84,6 +85,7 @@ func run() error {
 		listenErr <- client.Listen(ctx)
 	}()
 
+	candidateDone := make(chan error, 1)
 	candidateArgs := append(candidateCmd[1:], *serverURL, client.Pubkey())
 	logStep("starting candidate: %s %s", candidateCmd[0], strings.Join(candidateArgs, " "))
 	cmd := exec.CommandContext(ctx, candidateCmd[0], candidateArgs...)
@@ -92,7 +94,6 @@ func run() error {
 	if err := cmd.Start(); err != nil {
 		return fail("spec-tester.candidate.start", "start candidate: %v", err)
 	}
-	candidateDone := make(chan error, 1)
 	go func() {
 		candidateDone <- cmd.Wait()
 	}()
@@ -220,7 +221,7 @@ func (t *signalTrace) validateInboundAnswerer(selfPubkey, remotePubkey string) e
 				if !answerSeen {
 					return fail("answer.before-ice", "tester sent ICE before answer on inbound leg")
 				}
-				if err := validateICE(msg); err != nil {
+				if err := validateICE(msg, offer.Challenge); err != nil {
 					return err
 				}
 				continue
@@ -264,7 +265,7 @@ func (t *signalTrace) validateOutboundDialer(selfPubkey, remotePubkey string) er
 				if offer == nil {
 					continue
 				}
-				if err := validateICE(msg); err != nil {
+				if err := validateICE(msg, offer.Challenge); err != nil {
 					return err
 				}
 				continue
@@ -287,7 +288,7 @@ func (t *signalTrace) validateOutboundDialer(selfPubkey, remotePubkey string) er
 				if !answerSeen {
 					return fail("answer.before-ice", "candidate sent ICE before answer on outbound leg")
 				}
-				if err := validateICE(msg); err != nil {
+				if err := validateICE(msg, offer.Challenge); err != nil {
 					return err
 				}
 				continue
@@ -318,6 +319,9 @@ func validateOffer(msg wireMessage, expectedRecipient string) error {
 	ts, err := base64.RawURLEncoding.DecodeString(msg.Ts)
 	if err != nil || len(ts) != 8 {
 		return fail("offer.timestamp", "timestamp was not 8 base64url bytes")
+	}
+	if err := checkTsWindow(ts, "offer"); err != nil {
+		return err
 	}
 	recipient, err := base64.RawURLEncoding.DecodeString(expectedRecipient)
 	if err != nil {
@@ -374,6 +378,9 @@ func validateAnswer(msg wireMessage, offer wireMessage) error {
 	if err != nil || len(ts) != 8 {
 		return fail("answer.timestamp", "timestamp was not 8 base64url bytes")
 	}
+	if err := checkTsWindow(ts, "answer"); err != nil {
+		return err
+	}
 	sender, sig, err := senderAndSig(msg)
 	if err != nil {
 		return err
@@ -384,7 +391,13 @@ func validateAnswer(msg wireMessage, offer wireMessage) error {
 	return nil
 }
 
-func validateICE(msg wireMessage) error {
+func validateICE(msg wireMessage, sessionChallenge string) error {
+	if msg.Ts != "" {
+		return fail("ice.no-timestamp", "ICE candidate must not carry a ts field")
+	}
+	if msg.Challenge != sessionChallenge {
+		return fail("ice.challenge", "ICE challenge did not match session offer challenge")
+	}
 	challenge, err := base64.RawURLEncoding.DecodeString(msg.Challenge)
 	if err != nil || len(challenge) != 32 {
 		return fail("ice.challenge", "challenge was not 32 base64url bytes")
@@ -395,6 +408,20 @@ func validateICE(msg wireMessage) error {
 	}
 	if !ed25519.Verify(sender, icePayload(challenge, msg.Data), sig) {
 		return fail("ice.signature", "ICE signature did not verify over challenge and candidate JSON")
+	}
+	return nil
+}
+
+const tsWindowSecs = 30
+
+func checkTsWindow(ts []byte, kind string) error {
+	v := int64(binary.BigEndian.Uint64(ts))
+	diff := time.Now().Unix() - v
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > tsWindowSecs {
+		return fail(kind+".timestamp", "%s timestamp is %ds outside ±%ds window", kind, diff, tsWindowSecs)
 	}
 	return nil
 }
@@ -505,13 +532,6 @@ func shortKey(key string) string {
 		return key
 	}
 	return key[:12]
-}
-
-func shortChallenge(challenge string) string {
-	if len(challenge) <= 12 {
-		return challenge
-	}
-	return challenge[:12]
 }
 
 func getenv(key, fallback string) string {
