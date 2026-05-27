@@ -19,6 +19,8 @@ const CONN_CLEANUP_MS = 5_000;
 export interface ConnectOptions {
   serverUrl: string;
   rtcConfiguration?: RTCConfiguration;
+  /** Close outbound PeerConnections if no authenticated answer arrives in time. Set 0 or a negative value to disable. */
+  dialTimeoutMs?: number;
   /** Provide an existing key pair instead of loading from IndexedDB. */
   keyPair?: CryptoKeyPair;
   /**
@@ -38,6 +40,26 @@ export interface ConnectOptions {
   onIncoming?: (pc: RTCPeerConnection, remotePublicKey: CryptoKey) => void;
 }
 
+export type DialFailureCode =
+  | "peer-not-connected"
+  | "dial-timeout"
+  | "auth-failed"
+  | "signaling-failed";
+
+export class DialError extends Error {
+  readonly code: DialFailureCode;
+  readonly cause?: unknown;
+
+  constructor(code: DialFailureCode, message: string, cause?: unknown) {
+    super(message);
+    this.name = "DialError";
+    this.code = code;
+    this.cause = cause;
+  }
+}
+
+export type DialSetup = (pc: RTCPeerConnection) => void | Promise<void>;
+
 // Wire format sent through the relay.
 // base64url(JSON) keeps the payload newline-free for SSE framing.
 type WireMessage = {
@@ -46,6 +68,11 @@ type WireMessage = {
   challenge: string; // base64url(random[32]), set by dialer, echoed in all replies
   ts?: string; // base64url(uint64 unix seconds, big-endian) — offers and answers only
   sig: string; // signature — see crypto.ts for payload construction
+};
+
+type DialSettler = {
+  resolve: () => void;
+  reject: (err: unknown) => void;
 };
 
 function pack(msg: WireMessage): string {
@@ -111,6 +138,7 @@ export class ConnectClient {
   private readonly options: {
     serverUrl: string;
     rtcConfiguration: RTCConfiguration;
+    dialTimeoutMs: number;
     keyPair: CryptoKeyPair;
     acceptConnection?: (
       remotePublicKey: CryptoKey,
@@ -122,6 +150,11 @@ export class ConnectClient {
   // connections (each dial generates a fresh challenge).
   private readonly sessions = new Map<string, RTCPeerConnection>();
   private readonly sentOffers = new Map<string, string>();
+  private readonly dialSettlers = new Map<string, DialSettler>();
+  private readonly dialTimers = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
   private closed = false;
   private readonly abort = new AbortController();
 
@@ -137,6 +170,7 @@ export class ConnectClient {
       rtcConfiguration: options.rtcConfiguration ?? {
         iceServers: DEFAULT_ICE_SERVERS,
       },
+      dialTimeoutMs: options.dialTimeoutMs ?? 0,
       keyPair: keyPair,
       acceptConnection: options.acceptConnection,
       onIncoming: options.onIncoming,
@@ -167,55 +201,67 @@ export class ConnectClient {
   /**
    * Open a connection to the peer identified by `remotePublicKey`.
    *
-   * Returns a raw RTCPeerConnection. Add data channels or media tracks before
-   * returning control to trigger SDP negotiation. The library closes the PC
-   * if the answer or any ICE candidate fails auth verification.
+   * setup is called before the first offer is created or sent. Add data
+   * channels, media tracks, and event handlers there. Resolves after a verified
+   * answer is applied; the returned PeerConnection may still be ICE/DTLS
+   * connecting. The library closes the PC if signaling/auth fails.
    */
-  dial(remotePublicKey: CryptoKey): RTCPeerConnection {
+  async dial(
+    remotePublicKey: CryptoKey,
+    setup?: DialSetup,
+  ): Promise<RTCPeerConnection> {
     const challenge = crypto.getRandomValues(new Uint8Array(32));
     const pc = new RTCPeerConnection(this.options.rtcConfiguration);
-    let releaseIce = () => {};
-
-    // Key export is the only async step. onnegotiationneeded fires as a task
-    // after microtasks drain, so setupPromise is always resolved first.
-    const setupPromise = this.keyToString(remotePublicKey).then(
-      (remotePubkey) => {
-        this.sessions.set(this.sessionKey(remotePubkey, challenge), pc);
-        releaseIce = this.wireIce(pc, remotePubkey, challenge);
-
-        return remotePubkey;
-      },
-    );
-
-    setupPromise.catch((err) => {
-      pc.close();
-      console.error("[signaling] dial setup failed:", err);
+    let settle!: DialSettler;
+    const authenticated = new Promise<void>((resolve, reject) => {
+      settle = { resolve, reject };
     });
-
-    pc.onnegotiationneeded = async () => {
-      try {
-        const remotePubkey = await setupPromise;
-        if (pc.remoteDescription) return;
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        const key = this.sessionKey(remotePubkey, challenge);
-        this.sentOffers.set(key, offer.sdp!);
-        const ts = currentTs();
-        const answererPubkeyBytes = base64UrlDecode(remotePubkey);
-        await this.postOffer(
-          remotePubkey,
-          offer.sdp!,
-          challenge,
-          ts,
-          answererPubkeyBytes,
+    let dialTimer: ReturnType<typeof setTimeout> | undefined;
+    const clearDialTimer = () => {
+      if (dialTimer) clearTimeout(dialTimer);
+      dialTimer = undefined;
+    };
+    const startDialTimer = () => {
+      if (this.options.dialTimeoutMs <= 0) return;
+      dialTimer = setTimeout(() => {
+        settle.reject(
+          new DialError("dial-timeout", "dial timed out before answer"),
         );
-        releaseIce();
-      } catch (e) {
-        console.error("[signaling] offer failed:", e);
-      }
+      }, this.options.dialTimeoutMs);
     };
 
-    return pc;
+    const remotePubkey = await this.keyToString(remotePublicKey);
+    const key = this.sessionKey(remotePubkey, challenge);
+    this.sessions.set(key, pc);
+    this.dialSettlers.set(key, settle);
+    const releaseIce = this.wireIce(pc, remotePubkey, challenge);
+
+    try {
+      await setup?.(pc);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      this.sentOffers.set(key, offer.sdp!);
+      const ts = currentTs();
+      const answererPubkeyBytes = base64UrlDecode(remotePubkey);
+      await this.postOffer(
+        remotePubkey,
+        offer.sdp!,
+        challenge,
+        ts,
+        answererPubkeyBytes,
+      );
+      releaseIce();
+      startDialTimer();
+      await authenticated;
+      clearDialTimer();
+      return pc;
+    } catch (e) {
+      clearDialTimer();
+      const err = this.toDialError(e);
+      this.closeSession(key, pc);
+      console.error("[signaling] offer failed:", e);
+      throw err;
+    }
   }
 
   /** Close the SSE stream and all peer connections. */
@@ -225,6 +271,10 @@ export class ConnectClient {
     for (const pc of this.sessions.values()) pc.close();
     this.sessions.clear();
     this.sentOffers.clear();
+    for (const settler of this.dialSettlers.values()) {
+      settler.reject(new DialError("signaling-failed", "client closed"));
+    }
+    this.dialSettlers.clear();
   }
 
   private sessionKey(pubkey: string, challenge: Uint8Array): string {
@@ -240,6 +290,37 @@ export class ConnectClient {
     return crypto.subtle.importKey("raw", base64UrlDecode(s), "Ed25519", true, [
       "verify",
     ]);
+  }
+
+  private rejectDial(key: string, err: unknown): void {
+    const settler = this.dialSettlers.get(key);
+    if (!settler) return;
+    this.dialSettlers.delete(key);
+    settler.reject(err);
+  }
+
+  private resolveDial(key: string): void {
+    const settler = this.dialSettlers.get(key);
+    if (!settler) return;
+    this.dialSettlers.delete(key);
+    settler.resolve();
+  }
+
+  private closeSession(
+    key: string,
+    pc: RTCPeerConnection,
+    err?: unknown,
+  ): void {
+    if (err !== undefined) this.rejectDial(key, err);
+    else this.dialSettlers.delete(key);
+    pc.close();
+    this.sessions.delete(key);
+    this.sentOffers.delete(key);
+  }
+
+  private toDialError(err: unknown): DialError {
+    if (err instanceof DialError) return err;
+    return new DialError("signaling-failed", "signaling failed", err);
   }
 
   // Creates a PC for the answerer side and wires ICE candidate signing.
@@ -267,14 +348,16 @@ export class ConnectClient {
         pending.push(candidateJson);
         return;
       }
-      void this.postICE(remotePubkey, candidateJson, challenge);
+      void this.postICE(remotePubkey, candidateJson, challenge).catch(() => {});
     };
 
     return () => {
       if (released) return;
       released = true;
       for (const candidateJson of pending) {
-        void this.postICE(remotePubkey, candidateJson, challenge);
+        void this.postICE(remotePubkey, candidateJson, challenge).catch(
+          () => {},
+        );
       }
       pending.length = 0;
     };
@@ -341,10 +424,16 @@ export class ConnectClient {
   }
 
   private async send(remotePubkey: string, msg: WireMessage): Promise<void> {
-    await fetch(`${this.options.serverUrl}/${remotePubkey}`, {
+    const resp = await fetch(`${this.options.serverUrl}/${remotePubkey}`, {
       method: "POST",
       body: pack(msg),
     });
+    if (!resp.ok) {
+      throw new DialError(
+        resp.status === 404 ? "peer-not-connected" : "signaling-failed",
+        `relay POST failed: ${resp.status}`,
+      );
+    }
   }
 
   private async dispatch(msg: WireMessage): Promise<void> {
@@ -372,23 +461,43 @@ export class ConnectClient {
     // description is set, subsequent messages for the session are ICE.
     if (!pc.remoteDescription) {
       const offerSdp = this.sentOffers.get(key);
-      if (
-        !offerSdp ||
-        !(await this.handleAnswer(pc, msg, challenge, offerSdp))
-      ) {
-        pc.close();
+      let ok = false;
+      try {
+        ok =
+          !!offerSdp && (await this.handleAnswer(pc, msg, challenge, offerSdp));
+      } catch (e) {
+        this.closeSession(key, pc, this.toDialError(e));
         console.log("Failed to handle answer");
-        this.sessions.delete(key);
-        this.sentOffers.delete(key);
+        return;
+      }
+      if (!ok) {
+        this.closeSession(
+          key,
+          pc,
+          new DialError("auth-failed", "failed to authenticate answer"),
+        );
+        console.log("Failed to handle answer");
+      } else {
+        this.resolveDial(key);
       }
       return;
     }
 
-    if (!(await this.handleIce(pc, msg, challenge))) {
-      pc.close();
+    let iceOk = false;
+    try {
+      iceOk = await this.handleIce(pc, msg, challenge);
+    } catch (e) {
+      this.closeSession(key, pc, this.toDialError(e));
       console.log("Closing because failed handleIce", msg);
-      this.sessions.delete(key);
-      this.sentOffers.delete(key);
+      return;
+    }
+    if (!iceOk) {
+      this.closeSession(
+        key,
+        pc,
+        new DialError("auth-failed", "failed to authenticate ICE candidate"),
+      );
+      console.log("Closing because failed handleIce", msg);
     }
   }
 
@@ -440,10 +549,8 @@ export class ConnectClient {
       await this.postAnswer(msg.from, answer.sdp!, challenge, msg.data);
       releaseIce();
     } catch (e) {
-      incoming.close();
+      this.closeSession(key, incoming);
       console.log("Closing because failed to set", e);
-      this.sessions.delete(key);
-      this.sentOffers.delete(key);
       throw e;
     }
   }
@@ -545,6 +652,13 @@ export class ConnectClient {
           pc.connectionState === "failed" ||
           pc.connectionState === "closed"
         ) {
+          this.rejectDial(
+            key,
+            new DialError(
+              "signaling-failed",
+              "peer connection closed before authentication",
+            ),
+          );
           this.sessions.delete(key);
           this.sentOffers.delete(key);
         }

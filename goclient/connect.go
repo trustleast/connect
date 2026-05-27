@@ -62,6 +62,30 @@ type Options struct {
 	OnIncoming func(pc *webrtc.PeerConnection, remotePubkey string)
 }
 
+// DialOption configures one outbound Dial attempt.
+type DialOption func(*dialOptions)
+
+type dialOptions struct {
+	timeout time.Duration
+	setup   func(pc *webrtc.PeerConnection)
+}
+
+// WithDialTimeout closes the outbound PeerConnection if no authenticated answer
+// arrives after the offer is sent. Zero or negative values disable timeouts.
+func WithDialTimeout(timeout time.Duration) DialOption {
+	return func(opts *dialOptions) {
+		opts.timeout = timeout
+	}
+}
+
+// WithDialSetup runs setup before the first offer is created or sent. Add data
+// channels, media tracks, and event handlers here.
+func WithDialSetup(setup func(pc *webrtc.PeerConnection)) DialOption {
+	return func(opts *dialOptions) {
+		opts.setup = setup
+	}
+}
+
 // wireMessage is the signed envelope relayed through the server.
 // base64url(JSON) keeps the payload newline-free for SSE framing.
 type wireMessage struct {
@@ -99,8 +123,29 @@ type connState struct {
 	pc         *webrtc.PeerConnection
 	releaseICE func()
 
+	authOnce sync.Once
+	authDone chan error
+
 	mu       sync.RWMutex
 	offerSdp string
+}
+
+func (s *connState) resolveAuth() {
+	s.authOnce.Do(func() {
+		if s.authDone != nil {
+			s.authDone <- nil
+			close(s.authDone)
+		}
+	})
+}
+
+func (s *connState) rejectAuth(err error) {
+	s.authOnce.Do(func() {
+		if s.authDone != nil {
+			s.authDone <- err
+			close(s.authDone)
+		}
+	})
 }
 
 func (s *connState) setOfferSdp(offerSdp string) {
@@ -148,11 +193,19 @@ func New(opts Options) (*Client, error) {
 }
 
 // Dial opens a connection to the peer identified by remotePubkey (base64url).
-// Returns a raw *webrtc.PeerConnection. Add data channels or media tracks
-// before returning — they will be included in the initial offer. The library
-// closes the PC if the answer or any ICE candidate fails auth verification.
+// WithDialSetup is called before the first offer is created or sent; add data
+// channels, media tracks, and event handlers there. Dial returns after a
+// verified answer is applied. The returned PeerConnection may still be ICE/DTLS
+// connecting. The library closes the PC if signaling/auth fails.
 // ctx governs all signaling HTTP requests for this connection.
-func (c *Client) Dial(ctx context.Context, remotePubkey string) (*webrtc.PeerConnection, error) {
+func (c *Client) Dial(ctx context.Context, remotePubkey string, options ...DialOption) (*webrtc.PeerConnection, error) {
+	var opts dialOptions
+	for _, option := range options {
+		if option != nil {
+			option(&opts)
+		}
+	}
+
 	challenge := make([]byte, 32)
 	if _, err := rand.Read(challenge); err != nil {
 		return nil, fmt.Errorf("generating challenge: %w", err)
@@ -163,27 +216,62 @@ func (c *Client) Dial(ctx context.Context, remotePubkey string) (*webrtc.PeerCon
 		return nil, err
 	}
 
-	state := &connState{pc: pc, releaseICE: releaseICE}
-	c.conns.Store(makeConnKey(remotePubkey, challenge), state)
+	key := makeConnKey(remotePubkey, challenge)
+	state := &connState{pc: pc, releaseICE: releaseICE, authDone: make(chan error, 1)}
+	c.conns.Store(key, state)
 
-	pc.OnNegotiationNeeded(func() {
-		if err := c.createAndSendOffer(ctx, remotePubkey, state, challenge); err != nil {
-			pc.Close()
-			c.conns.Delete(makeConnKey(remotePubkey, challenge))
+	if opts.setup != nil {
+		opts.setup(pc)
+	}
+	if err := c.createAndSendOffer(ctx, remotePubkey, state, challenge); err != nil {
+		c.closeConnWithError(key, state, err)
+		return nil, err
+	}
+
+	var timer *time.Timer
+	if opts.timeout > 0 {
+		timer = time.AfterFunc(opts.timeout, func() {
+			if state.pc.RemoteDescription() != nil {
+				return
+			}
+			c.closeConnWithError(key, state, fmt.Errorf("dial timed out before answer"))
+		})
+	}
+	defer timer.Stop()
+
+	select {
+	case err := <-state.authDone:
+		if err != nil {
+			return nil, err
 		}
-	})
-
-	return pc, nil
+		return pc, nil
+	case <-ctx.Done():
+		err := ctx.Err()
+		c.closeConnWithError(key, state, err)
+		return nil, err
+	}
 }
 
 // Close closes all peer connections. Cancel the context passed to Listen to
 // stop the SSE loop.
 func (c *Client) Close() {
 	c.conns.Range(func(_, v any) bool {
-		v.(*connState).pc.Close()
+		state := v.(*connState)
+		state.rejectAuth(fmt.Errorf("client closed"))
+		state.pc.Close()
 		return true
 	})
 	c.conns.Clear()
+}
+
+func (c *Client) closeConn(key connKey, state *connState) {
+	state.pc.Close()
+	c.conns.Delete(key)
+}
+
+func (c *Client) closeConnWithError(key connKey, state *connState, err error) {
+	state.rejectAuth(err)
+	c.closeConn(key, state)
 }
 
 // makePC creates a new PeerConnection keyed by remotePubkey+challenge.
@@ -301,6 +389,9 @@ func (c *Client) send(ctx context.Context, remotePubkey string, msg wireMessage)
 		return err
 	}
 	resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("relay POST failed: %s", resp.Status)
+	}
 	return nil
 }
 
@@ -421,9 +512,13 @@ func (c *Client) handleAnswer(state *connState, msg wireMessage, challenge []byt
 		return fmt.Errorf("invalid answer signature from %s", msg.From)
 	}
 
-	return pc.SetRemoteDescription(webrtc.SessionDescription{
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeAnswer, SDP: msg.Data,
-	})
+	}); err != nil {
+		return err
+	}
+	state.resolveAuth()
+	return nil
 }
 
 // handleICE verifies the ICE candidate signature, then adds the candidate.
@@ -469,6 +564,7 @@ func (c *Client) Listen(ctx context.Context) error {
 					switch v.(*connState).pc.ConnectionState() {
 					case webrtc.PeerConnectionStateFailed,
 						webrtc.PeerConnectionStateClosed:
+						v.(*connState).rejectAuth(fmt.Errorf("peer connection closed before authentication"))
 						c.conns.Delete(k)
 					}
 					return true
@@ -583,14 +679,12 @@ func (c *Client) handleSSEMessage(ctx context.Context, line string) error {
 		if pc.RemoteDescription() == nil {
 			// No remote description, this is an answer to an offer we sent.
 			if err := c.handleAnswer(state, msg, challenge); err != nil {
-				pc.Close()
-				c.conns.Delete(key)
+				c.closeConnWithError(key, state, err)
 			}
 		} else {
 			// Remote description already set, this must be an ICE candidate.
 			if err := c.handleICE(pc, msg, challenge); err != nil {
-				pc.Close()
-				c.conns.Delete(key)
+				c.closeConnWithError(key, state, err)
 			}
 		}
 	}
