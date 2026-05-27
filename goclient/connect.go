@@ -60,6 +60,26 @@ type Options struct {
 	// if a subsequent ICE candidate fails auth — "incoming" means a valid
 	// authenticated offer arrived, not that a working P2P connection exists.
 	OnIncoming func(pc *webrtc.PeerConnection, remotePubkey string)
+	// OnSignal observes every raw signaling payload sent or received by this
+	// client. It is informational only; callbacks cannot mutate or drop
+	// messages. Payload is the exact base64url JSON envelope posted to, or read
+	// from, the relay.
+	OnSignal func(SignalEvent)
+}
+
+// SignalDirection identifies where a signaling payload was observed.
+type SignalDirection string
+
+const (
+	SignalInboundSSE   SignalDirection = "inbound-sse"
+	SignalOutboundPOST SignalDirection = "outbound-post"
+)
+
+// SignalEvent is a passive observation of one wire payload.
+type SignalEvent struct {
+	Direction    SignalDirection
+	RemotePubkey string
+	Payload      string
 }
 
 // DialOption configures one outbound Dial attempt.
@@ -378,6 +398,13 @@ func (c *Client) send(ctx context.Context, remotePubkey string, msg wireMessage)
 		return err
 	}
 	body := base64.RawURLEncoding.EncodeToString(b)
+	if c.opts.OnSignal != nil {
+		c.opts.OnSignal(SignalEvent{
+			Direction:    SignalOutboundPOST,
+			RemotePubkey: remotePubkey,
+			Payload:      body,
+		})
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.opts.ServerURL+"/"+remotePubkey, strings.NewReader(body))
@@ -420,7 +447,7 @@ func (c *Client) createAndSendOffer(ctx context.Context, remotePubkey string, st
 }
 
 // handleOffer verifies timestamp and signature (including recipient binding),
-// creates a PC, negotiates an answer, calls onIncoming, then sends the answer.
+// creates a PC, calls onIncoming, negotiates an answer, then sends the answer.
 // AcceptConnection filtering is done by the caller before this is invoked.
 func (c *Client) handleOffer(ctx context.Context, msg wireMessage, challenge []byte) (*webrtc.PeerConnection, error) {
 	tsBytes, err := base64.RawURLEncoding.DecodeString(msg.Ts)
@@ -449,7 +476,12 @@ func (c *Client) handleOffer(ctx context.Context, msg wireMessage, challenge []b
 
 	pc, releaseICE, err := c.makePC(ctx, msg.From, challenge)
 	if err != nil {
+		fmt.Println("error creating peer connection:", err)
 		return nil, err
+	}
+
+	if c.opts.OnIncoming != nil {
+		c.opts.OnIncoming(pc, msg.From)
 	}
 
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
@@ -457,6 +489,7 @@ func (c *Client) handleOffer(ctx context.Context, msg wireMessage, challenge []b
 	}); err != nil {
 		return pc, err
 	}
+
 	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
 		return pc, err
@@ -467,10 +500,6 @@ func (c *Client) handleOffer(ctx context.Context, msg wireMessage, challenge []b
 	desc := pc.LocalDescription()
 	if desc == nil {
 		return pc, fmt.Errorf("no local description after answer")
-	}
-
-	if c.opts.OnIncoming != nil {
-		c.opts.OnIncoming(pc, msg.From)
 	}
 
 	if err := c.postAnswer(ctx, msg.From, desc.SDP, challenge, msg.Data); err != nil {
@@ -628,7 +657,15 @@ func (c *Client) connectSSE(ctx context.Context, path string) error {
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
-		if err := c.handleSSEMessage(ctx, line[len("data: "):]); err != nil {
+		payload := line[len("data: "):]
+		if c.opts.OnSignal != nil {
+			c.opts.OnSignal(SignalEvent{
+				Direction:    SignalInboundSSE,
+				RemotePubkey: c.Pubkey(),
+				Payload:      payload,
+			})
+		}
+		if err := c.handleSSEMessage(ctx, payload); err != nil {
 			return err
 		}
 	}
@@ -661,8 +698,7 @@ func (c *Client) handleSSEMessage(ctx context.Context, line string) error {
 	key := makeConnKey(msg.From, challenge)
 	val, known := c.conns.Load(key)
 	if !known {
-		// No session for this pubkey+challenge: treat as a new offer.
-		if c.opts.AcceptConnection != nil && !c.opts.AcceptConnection(msg.From) {
+		if c.opts.AcceptConnection == nil || !c.opts.AcceptConnection(msg.From) {
 			return nil
 		}
 		pc, err := c.handleOffer(ctx, msg, challenge)
