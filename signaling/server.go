@@ -2,6 +2,7 @@ package connect
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/binary"
@@ -11,11 +12,14 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	_AuthMessageSize = 8 + ed25519.SignatureSize // 8-byte timestamp + 64-byte signature
+	_AuthMessageSize   = 8 + ed25519.SignatureSize // 8-byte timestamp + 64-byte signature
+	_MaxBodySize       = 4 << 10                   // 4 KiB — enough for a base64-encoded 3 KiB payload, which is more than enough for typical signaling messages
+	_InvalidCharacters = "\n\r"
 )
 
 var (
@@ -53,13 +57,24 @@ type Config struct {
 }
 
 type server struct {
-	hub     *hub
-	peers   PeerFinder
-	nodeURL string
+	hub      *hub
+	peers    PeerFinder
+	nodeURL  string
+	bodyPool sync.Pool
 }
 
-func NewServer(cfg Config) *server {
-	return &server{hub: &hub{}, peers: cfg.PeerFinder, nodeURL: cfg.NodeURL}
+func NewServer(ctx context.Context, cfg Config) *server {
+	return &server{
+		hub:     newHub(ctx),
+		peers:   cfg.PeerFinder,
+		nodeURL: cfg.NodeURL,
+		bodyPool: sync.Pool{
+			New: func() any {
+				b := make([]byte, _MaxBodySize)
+				return &b
+			},
+		},
+	}
 }
 
 // targetPeer returns the peer URL that should handle pubkey using rendezvous
@@ -225,29 +240,7 @@ func (s *server) listenForMessages(w http.ResponseWriter, r *http.Request, pubke
 	w.WriteHeader(http.StatusOK)
 	fl.Flush() // send headers immediately so the client unblocks
 
-	ch := s.hub.register(pubkeyStr)
-	defer s.hub.unregister(pubkeyStr, ch)
-
-	tick := time.NewTicker(20 * time.Second)
-	defer tick.Stop()
-
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case data, ok := <-ch:
-			if !ok {
-				return // displaced by a newer connection
-			}
-			w.Write(ssePrefix)
-			w.Write(data)
-			w.Write(sseSuffix)
-			fl.Flush()
-		case <-tick.C:
-			w.Write(sseKeepalive)
-			fl.Flush()
-		}
-	}
+	s.hub.register(r.Context(), pubkeyStr, w, fl.Flush)
 }
 
 // --- Message -------------------------------------------------------------
@@ -261,16 +254,21 @@ func (s *server) listenForMessages(w http.ResponseWriter, r *http.Request, pubke
 //
 // Returns 404 if the target pubkey has no active SSE connection.
 func (s *server) postMessage(w http.ResponseWriter, r *http.Request, targetStr string) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<10))
-	if err != nil {
-		http.Error(w, "read error", http.StatusBadRequest)
-		return
-	}
-	if len(body) == 0 {
+	bufp := s.bodyPool.Get().(*[]byte)
+	defer s.bodyPool.Put(bufp)
+
+	n, err := io.ReadFull(r.Body, *bufp)
+	if err == io.EOF {
 		http.Error(w, "empty body", http.StatusBadRequest)
 		return
 	}
-	if bytes.IndexByte(body, '\n') >= 0 || bytes.IndexByte(body, '\r') >= 0 {
+	if err != nil && err != io.ErrUnexpectedEOF {
+		http.Error(w, "read error", http.StatusBadRequest)
+		return
+	}
+	body := (*bufp)[:n]
+
+	if bytes.ContainsAny(body, _InvalidCharacters) {
 		http.Error(w, "body must not contain newlines; send base64-encoded data", http.StatusBadRequest)
 		return
 	}

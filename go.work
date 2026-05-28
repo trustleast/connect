@@ -1,8 +1,8 @@
-go 1.24
+go 1.25.0
 
 use (
-	./signaling
-	./signaling/cmd/server
 	./connect-http-bridge
 	./goclient
+	./signaling
+	./signaling/cmd/server
 )

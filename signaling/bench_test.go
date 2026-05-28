@@ -51,7 +51,7 @@ func postSDP(client *http.Client, serverURL, targetPubStr string, body []byte) *
 // BenchmarkSSERoundtrip measures end-to-end delivery: POST entering the server
 // to the message appearing on the receiver's SSE stream.
 func BenchmarkSSERoundtrip(b *testing.B) {
-	srv := httptest.NewServer(NewServer(Config{}))
+	srv := httptest.NewServer(NewServer(b.Context(), Config{}))
 	defer srv.Close()
 
 	receiverPub, receiverPriv, _ := ed25519.GenerateKey(nil)

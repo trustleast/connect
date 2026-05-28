@@ -70,7 +70,7 @@ func main() {
 
 	httpSrv := &http.Server{
 		Addr: *addr,
-		Handler: connect.NewServer(connect.Config{
+		Handler: connect.NewServer(ctx, connect.Config{
 			PeerFinder: peerFinder,
 			NodeURL:    *nodeURL,
 		}),
@@ -78,7 +78,7 @@ func main() {
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      0, // disabled — SSE connections are long-lived
 		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    4 << 10,
+		MaxHeaderBytes:    1 << 10, // 1 KiB
 	}
 
 	// Bind directly to a single interface instead of relying on dual-stack to minimize resource utilization.
