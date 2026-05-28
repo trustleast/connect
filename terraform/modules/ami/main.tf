@@ -14,7 +14,7 @@ terraform {
 data "aws_region" "current" {}
 
 locals {
-  repo_root = abspath("${path.module}/../../..")
+  repo_root = abspath("${path.module}/../../../signaling")
 
   # SHA1 over every Go source file (sorted for determinism). Used as the
   # trigger for the build and publish steps — if no .go file changed, neither
