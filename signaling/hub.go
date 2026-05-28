@@ -72,18 +72,17 @@ func (h *hub) register(pubkey string, nc net.Conn) {
 	}
 }
 
-// deliver writes data into the SSE stream registered under pubkey using a
-// single vectored write. Returns false if pubkey has no active connection or
-// the write fails.
-func (h *hub) deliver(pubkey string, data []byte) bool {
+// deliver writes a pre-framed SSE payload to the stream registered under
+// pubkey. The caller is responsible for framing (prefix + body + suffix).
+// Returns false if pubkey has no active connection or the write fails.
+func (h *hub) deliver(pubkey string, frame []byte) bool {
 	val, ok := h.clients.Load(pubkey)
 	if !ok {
 		return false
 	}
 	c := val.(*conn)
 	c.mu.Lock()
-	bufs := net.Buffers{ssePrefix, data, sseSuffix}
-	_, err := bufs.WriteTo(c.nc)
+	_, err := c.nc.Write(frame)
 	c.mu.Unlock()
 	if err != nil {
 		if h.clients.CompareAndDelete(pubkey, c) {

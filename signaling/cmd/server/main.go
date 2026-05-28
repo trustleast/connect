@@ -76,9 +76,12 @@ func main() {
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      0, // disabled — SSE connections are long-lived
+		WriteTimeout:      0,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1 << 10, // 1 KiB
+		// Disable HTTP/2: ServeTLS enables it automatically via ALPN, but
+		// hijacking (required for SSE) is not available on HTTP/2 streams.
+		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 	}
 
 	// Bind directly to a single interface instead of relying on dual-stack to minimize resource utilization.

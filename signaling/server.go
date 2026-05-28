@@ -18,8 +18,14 @@ import (
 
 const (
 	_AuthMessageSize   = 8 + ed25519.SignatureSize // 8-byte timestamp + 64-byte signature
-	_MaxBodySize       = 4 << 10                   // 4 KiB — enough for a base64-encoded 3 KiB payload, which is more than enough for typical signaling messages
+	_MaxBodySize       = 4 << 10                   // 4 KiB
 	_InvalidCharacters = "\n\r"
+
+	// SSE frame layout: "data: " <body> "\n\n"
+	// The prefix is pre-filled in the pool New func so it is never copied at runtime.
+	_SSEPrefixLen = 6 // len("data: ")
+	_SSESuffixLen = 2 // len("\n\n")
+	_FrameSize    = _SSEPrefixLen + _MaxBodySize + _SSESuffixLen
 )
 
 var (
@@ -66,10 +72,10 @@ type Config struct {
 }
 
 type server struct {
-	hub      *hub
-	peers    PeerFinder
-	nodeURL  string
-	bodyPool sync.Pool
+	hub       *hub
+	peers     PeerFinder
+	nodeURL   string
+	framePool sync.Pool
 }
 
 func NewServer(ctx context.Context, cfg Config) *server {
@@ -77,9 +83,10 @@ func NewServer(ctx context.Context, cfg Config) *server {
 		hub:     newHub(ctx),
 		peers:   cfg.PeerFinder,
 		nodeURL: cfg.NodeURL,
-		bodyPool: sync.Pool{
+		framePool: sync.Pool{
 			New: func() any {
-				b := make([]byte, _MaxBodySize)
+				b := make([]byte, _FrameSize)
+				copy(b, ssePrefix) // pre-fill prefix — valid for pool lifetime
 				return &b
 			},
 		},
@@ -195,7 +202,7 @@ func verifyAuth(rawSignature string, pubkey ed25519.PublicKey) error {
 		return fmt.Errorf("timestamp outside window")
 	}
 
-	if !ed25519.Verify(pubkey, append([]byte(sseAuthDomain), tsBytes...), sig) {
+	if !ed25519.Verify(pubkey, append(sseAuthDomain, tsBytes...), sig) {
 		return fmt.Errorf("signature verification failed")
 	}
 	return nil
@@ -254,10 +261,12 @@ func (s *server) listenForMessages(w http.ResponseWriter, r *http.Request, pubke
 //
 // Returns 404 if the target pubkey has no active SSE connection.
 func (s *server) postMessage(w http.ResponseWriter, r *http.Request, targetStr string) {
-	bufp := s.bodyPool.Get().(*[]byte)
-	defer s.bodyPool.Put(bufp)
+	framep := s.framePool.Get().(*[]byte)
+	defer s.framePool.Put(framep)
 
-	n, err := io.ReadFull(r.Body, *bufp)
+	// Read body directly into the frame buffer after the pre-filled prefix.
+	body := (*framep)[_SSEPrefixLen : _SSEPrefixLen+_MaxBodySize]
+	n, err := io.ReadFull(r.Body, body)
 	if err == io.EOF {
 		http.Error(w, "empty body", http.StatusBadRequest)
 		return
@@ -266,14 +275,15 @@ func (s *server) postMessage(w http.ResponseWriter, r *http.Request, targetStr s
 		http.Error(w, "read error", http.StatusBadRequest)
 		return
 	}
-	body := (*bufp)[:n]
 
-	if bytes.ContainsAny(body, _InvalidCharacters) {
+	if bytes.ContainsAny(body[:n], _InvalidCharacters) {
 		http.Error(w, "body must not contain newlines; send base64-encoded data", http.StatusBadRequest)
 		return
 	}
 
-	if !s.hub.deliver(targetStr, body) {
+	// Append suffix and deliver the complete frame in one write.
+	copy((*framep)[_SSEPrefixLen+n:], sseSuffix)
+	if !s.hub.deliver(targetStr, (*framep)[:_SSEPrefixLen+n+_SSESuffixLen]) {
 		http.Error(w, "recipient not connected", http.StatusNotFound)
 		return
 	}
