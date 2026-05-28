@@ -56,16 +56,16 @@ func run() error {
 		listenErr <- client.Listen(ctx)
 	}()
 
+	dialCtx, dialCancel := context.WithTimeout(ctx, *dialTimeout)
+	defer dialCancel()
+
 	outboundDone := make(chan error, 1)
-	pc, err := client.Dial(ctx, remotePubkey,
-		connect.WithDialTimeout(*dialTimeout),
-		connect.WithDialSetup(func(pc *webrtc.PeerConnection) {
-			pc.CreateDataChannel("test", nil)
-			pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-				respondToChallenge(dc, outboundDone)
-			})
-		}),
-	)
+	pc, err := client.Dial(dialCtx, remotePubkey, func(pc *webrtc.PeerConnection) {
+		pc.CreateDataChannel("test", nil)
+		pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+			respondToChallenge(dc, outboundDone)
+		})
+	})
 	if err != nil {
 		return fmt.Errorf("outbound signaling/auth failed: %w", err)
 	}

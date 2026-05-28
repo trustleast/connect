@@ -42,28 +42,21 @@ var defaultConfiguration = webrtc.Configuration{
 
 // Options configures a Client.
 type Options struct {
-	ServerURL string
-	// Configuration is the WebRTC configuration. If zero, a default configuration
-	// with a Google STUN server is used.
-	Configuration webrtc.Configuration
+	ServerURL     string
+	Configuration webrtc.Configuration // defaults to Google STUN if empty
 	SettingEngine *webrtc.SettingEngine
-	// PrivateKey is an optional Ed25519 private key. If nil, one is generated.
-	PrivateKey ed25519.PrivateKey
-	// AcceptConnection is called on receipt of an offer from a new sender, before
-	// signature verification. Return false to silently drop the offer — no
-	// response is sent to the dialer, to avoid leaking whether the key is active.
-	// If nil, all offers are accepted.
+	PrivateKey    ed25519.PrivateKey // generated if nil
+	// AcceptConnection is called after offer signature and timestamp verification,
+	// before a PeerConnection is created or an answer sent. Return false to silently
+	// drop the offer — no response is sent to the dialer, to avoid leaking whether
+	// the key is active. If nil, all offers are denied.
 	AcceptConnection func(remotePubkey string) bool
 	// OnIncoming is called when an incoming offer has been verified and accepted,
-	// after SetLocalDescription but before the answer is sent. Wire data channel
-	// and media track handlers here. The PC may still be closed by the library
-	// if a subsequent ICE candidate fails auth — "incoming" means a valid
-	// authenticated offer arrived, not that a working P2P connection exists.
+	// before the answer is sent. Wire OnDataChannel and media track handlers here.
+	// The PC may still be closed if a subsequent ICE candidate fails auth.
 	OnIncoming func(pc *webrtc.PeerConnection, remotePubkey string)
 	// OnSignal observes every raw signaling payload sent or received by this
-	// client. It is informational only; callbacks cannot mutate or drop
-	// messages. Payload is the exact base64url JSON envelope posted to, or read
-	// from, the relay.
+	// client. It is informational only; callbacks cannot mutate or drop messages.
 	OnSignal func(SignalEvent)
 }
 
@@ -82,43 +75,18 @@ type SignalEvent struct {
 	Payload      string
 }
 
-// DialOption configures one outbound Dial attempt.
-type DialOption func(*dialOptions)
-
-type dialOptions struct {
-	timeout time.Duration
-	setup   func(pc *webrtc.PeerConnection)
-}
-
-// WithDialTimeout closes the outbound PeerConnection if no authenticated answer
-// arrives after the offer is sent. Zero or negative values disable timeouts.
-func WithDialTimeout(timeout time.Duration) DialOption {
-	return func(opts *dialOptions) {
-		opts.timeout = timeout
-	}
-}
-
-// WithDialSetup runs setup before the first offer is created or sent. Add data
-// channels, media tracks, and event handlers here.
-func WithDialSetup(setup func(pc *webrtc.PeerConnection)) DialOption {
-	return func(opts *dialOptions) {
-		opts.setup = setup
-	}
-}
-
 // wireMessage is the signed envelope relayed through the server.
 // base64url(JSON) keeps the payload newline-free for SSE framing.
 type wireMessage struct {
-	From      string `json:"from"`         // base64url sender pubkey
-	Data      string `json:"data"`         // offer SDP | answer SDP | JSON(RTCIceCandidateInit)
-	Challenge string `json:"challenge"`    // base64url(random[32]), set by dialer
-	Ts        string `json:"ts,omitempty"` // base64url(uint64 unix seconds, big-endian) — offers and answers only
-	Sig       string `json:"sig"`          // ed25519 signature — see crypto.go for payload construction
+	From      string `json:"from"`
+	Data      string `json:"data"`
+	Challenge string `json:"challenge"`
+	Ts        string `json:"ts,omitempty"`
+	Sig       string `json:"sig"`
 }
 
 // connKey is the composite key for the conns map. Including the challenge
-// allows a single remote pubkey to have multiple simultaneous connections
-// (each dial generates a fresh challenge).
+// allows a single remote pubkey to have multiple simultaneous connections.
 type connKey struct {
 	pubkey    string
 	challenge [32]byte
@@ -131,53 +99,51 @@ func makeConnKey(pubkey string, challenge []byte) connKey {
 	return k
 }
 
-// Client connects to the relay server, authenticates its SSE stream, and
-// manages WebRTC peer connections on behalf of the caller.
+// Client connects to the relay server and manages WebRTC peer connections.
 type Client struct {
 	api   *webrtc.API
 	opts  Options
 	conns sync.Map // connKey → *connState
 }
 
+// connState holds per-connection state.
+//
+// For outbound connections (created by Dial): authDone is a buffered channel
+// that receives nil on successful auth or an error on failure; offerSdp is the
+// SDP sent with the offer, written before the connState is stored in conns and
+// read only after it is loaded, so no additional synchronization is needed.
+//
+// For inbound connections (created by handleOffer): authDone and offerSdp are
+// zero; no goroutine is waiting on auth.
 type connState struct {
-	pc         *webrtc.PeerConnection
-	releaseICE func()
-
-	authOnce sync.Once
-	authDone chan error
-
-	mu       sync.RWMutex
-	offerSdp string
+	pc       *webrtc.PeerConnection
+	authDone chan error // buffered(1); nil for inbound connections
+	offerSdp string     // set before conns.Store; empty for inbound connections
 }
 
-func (s *connState) resolveAuth() {
-	s.authOnce.Do(func() {
-		if s.authDone != nil {
-			s.authDone <- nil
-			close(s.authDone)
-		}
-	})
+// sendAuth signals the auth channel if set. Non-blocking: if a prior signal
+// was already sent (e.g. timeout fired before auth completed), this is a no-op.
+func sendAuth(ch chan error, err error) {
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- err:
+	default:
+	}
 }
 
-func (s *connState) rejectAuth(err error) {
-	s.authOnce.Do(func() {
-		if s.authDone != nil {
-			s.authDone <- err
-			close(s.authDone)
-		}
-	})
-}
-
-func (s *connState) setOfferSdp(offerSdp string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.offerSdp = offerSdp
-}
-
-func (s *connState) getOfferSdp() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.offerSdp
+// parseSenderAndSig decodes the sender public key and signature from a message.
+func parseSenderAndSig(from, sig string) (ed25519.PublicKey, []byte, error) {
+	sender, err := base64.RawURLEncoding.DecodeString(from)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid sender pubkey")
+	}
+	sigBytes, err := base64.RawURLEncoding.DecodeString(sig)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid signature")
+	}
+	return ed25519.PublicKey(sender), sigBytes, nil
 }
 
 func (c *Client) pubKeyRaw() ed25519.PublicKey {
@@ -186,7 +152,6 @@ func (c *Client) pubKeyRaw() ed25519.PublicKey {
 
 // Pubkey returns the base64url-encoded Ed25519 public key identifying this
 // client on the relay. Share this so others can reach you via Dial.
-// Use base32Encode(base64RawURLDecode(Pubkey())) to get a human-friendly form.
 func (c *Client) Pubkey() string {
 	return base64.RawURLEncoding.EncodeToString(c.pubKeyRaw())
 }
@@ -213,17 +178,13 @@ func New(opts Options) (*Client, error) {
 }
 
 // Dial opens a connection to the peer identified by remotePubkey (base64url).
-// WithDialSetup is called before the first offer is created or sent; add data
-// channels, media tracks, and event handlers there. Dial returns after a
-// verified answer is applied. The returned PeerConnection may still be ICE/DTLS
-// connecting. The library closes the PC if signaling/auth fails.
-// ctx governs all signaling HTTP requests for this connection.
-func (c *Client) Dial(ctx context.Context, remotePubkey string, options ...DialOption) (*webrtc.PeerConnection, error) {
-	var opts dialOptions
-	for _, option := range options {
-		if option != nil {
-			option(&opts)
-		}
+// setup is called before the offer is created; add data channels, media tracks,
+// and event handlers there. Dial returns after a verified answer is applied;
+// the returned PC may still be ICE/DTLS connecting. Use context.WithTimeout
+// to limit how long Dial waits for an authenticated answer.
+func (c *Client) Dial(ctx context.Context, remotePubkey string, setup func(*webrtc.PeerConnection)) (*webrtc.PeerConnection, error) {
+	if setup == nil {
+		return nil, fmt.Errorf("a data channel or media track must be set up")
 	}
 
 	challenge := make([]byte, 32)
@@ -236,28 +197,34 @@ func (c *Client) Dial(ctx context.Context, remotePubkey string, options ...DialO
 		return nil, err
 	}
 
+	setup(pc)
+
+	offer, err := pc.CreateOffer(nil)
+	if err != nil {
+		pc.Close()
+		return nil, err
+	}
+	if err := pc.SetLocalDescription(offer); err != nil {
+		pc.Close()
+		return nil, err
+	}
+	desc := pc.LocalDescription()
+	if desc == nil {
+		pc.Close()
+		return nil, fmt.Errorf("no local description after creating offer")
+	}
+
+	// Store in conns with offerSdp set before posting the offer, so that when
+	// the answer arrives on the SSE stream it can be verified immediately.
 	key := makeConnKey(remotePubkey, challenge)
-	state := &connState{pc: pc, releaseICE: releaseICE, authDone: make(chan error, 1)}
+	state := &connState{pc: pc, authDone: make(chan error, 1), offerSdp: desc.SDP}
 	c.conns.Store(key, state)
 
-	if opts.setup != nil {
-		opts.setup(pc)
-	}
-	if err := c.createAndSendOffer(ctx, remotePubkey, state, challenge); err != nil {
+	if err := c.postOffer(ctx, remotePubkey, desc.SDP, challenge, currentTsBytes()); err != nil {
 		c.closeConnWithError(key, state, err)
 		return nil, err
 	}
-
-	var timer *time.Timer
-	if opts.timeout > 0 {
-		timer = time.AfterFunc(opts.timeout, func() {
-			if state.pc.RemoteDescription() != nil {
-				return
-			}
-			c.closeConnWithError(key, state, fmt.Errorf("dial timed out before answer"))
-		})
-	}
-	defer timer.Stop()
+	releaseICE()
 
 	select {
 	case err := <-state.authDone:
@@ -277,7 +244,7 @@ func (c *Client) Dial(ctx context.Context, remotePubkey string, options ...DialO
 func (c *Client) Close() {
 	c.conns.Range(func(_, v any) bool {
 		state := v.(*connState)
-		state.rejectAuth(fmt.Errorf("client closed"))
+		sendAuth(state.authDone, fmt.Errorf("client closed"))
 		state.pc.Close()
 		return true
 	})
@@ -290,44 +257,25 @@ func (c *Client) closeConn(key connKey, state *connState) {
 }
 
 func (c *Client) closeConnWithError(key connKey, state *connState, err error) {
-	state.rejectAuth(err)
+	sendAuth(state.authDone, err)
 	c.closeConn(key, state)
 }
 
-// makePC creates a new PeerConnection keyed by remotePubkey+challenge.
-// Multiple simultaneous connections to the same peer are allowed — each dial
-// generates a fresh challenge, yielding a distinct connKey.
-// ctx governs all ICE candidate HTTP sends for this connection.
-// makePC creates a new PeerConnection and wires ICE candidate signing.
-// The caller is responsible for storing it in c.conns.
+// makePC creates a new PeerConnection and buffers ICE candidates until
+// releaseICE is called. Call releaseICE after the local description is set
+// and the offer/answer is sent to the remote peer.
 func (c *Client) makePC(ctx context.Context, remotePubkey string, challenge []byte) (*webrtc.PeerConnection, func(), error) {
 	pc, err := c.api.NewPeerConnection(c.opts.Configuration)
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating peer connection: %w", err)
 	}
 
-	var iceMu sync.Mutex
-	iceReleased := false
-	var pendingICE []string
+	var mu sync.Mutex
+	released := false
+	var pending []string
 
-	sendICE := func(candidateJSON string) {
+	send := func(candidateJSON string) {
 		_ = c.postICE(ctx, remotePubkey, candidateJSON, challenge)
-	}
-
-	releaseICE := func() {
-		iceMu.Lock()
-		if iceReleased {
-			iceMu.Unlock()
-			return
-		}
-		iceReleased = true
-		pending := append([]string(nil), pendingICE...)
-		pendingICE = nil
-		iceMu.Unlock()
-
-		for _, candidateJSON := range pending {
-			sendICE(candidateJSON)
-		}
 	}
 
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
@@ -338,57 +286,68 @@ func (c *Client) makePC(ctx context.Context, remotePubkey string, challenge []by
 		if err != nil {
 			return
 		}
-		candidateJSON := string(b)
-
-		iceMu.Lock()
-		if !iceReleased {
-			pendingICE = append(pendingICE, candidateJSON)
-			iceMu.Unlock()
+		j := string(b)
+		mu.Lock()
+		if !released {
+			pending = append(pending, j)
+			mu.Unlock()
 			return
 		}
-		iceMu.Unlock()
-
-		sendICE(candidateJSON)
+		mu.Unlock()
+		send(j)
 	})
 
-	return pc, releaseICE, nil
+	return pc, func() {
+		mu.Lock()
+		if released {
+			mu.Unlock()
+			return
+		}
+		released = true
+		flushed := pending
+		pending = nil
+		mu.Unlock()
+		for _, j := range flushed {
+			send(j)
+		}
+	}, nil
+}
+
+// signAndSend signs the given payload with the client's private key and sends
+// the message. msg.Sig must be empty; it is filled in by this function.
+func (c *Client) signAndSend(ctx context.Context, remotePubkey string, payload []byte, msg wireMessage) error {
+	msg.Sig = base64.RawURLEncoding.EncodeToString(ed25519.Sign(c.opts.PrivateKey, payload))
+	return c.send(ctx, remotePubkey, msg)
 }
 
 func (c *Client) postOffer(ctx context.Context, remotePubkey, offerSdp string, challenge, ts []byte) error {
-	remotePubKeyBytes, err := base64.RawURLEncoding.DecodeString(remotePubkey)
+	recipientBytes, err := base64.RawURLEncoding.DecodeString(remotePubkey)
 	if err != nil {
 		return fmt.Errorf("decoding remote pubkey: %w", err)
 	}
-
-	sig := ed25519.Sign(c.opts.PrivateKey, offerPayload(challenge, ts, remotePubKeyBytes, offerSdp))
-	return c.send(ctx, remotePubkey, wireMessage{
+	return c.signAndSend(ctx, remotePubkey, offerPayload(challenge, ts, recipientBytes, offerSdp), wireMessage{
 		From:      c.Pubkey(),
 		Data:      offerSdp,
 		Challenge: base64.RawURLEncoding.EncodeToString(challenge),
 		Ts:        base64.RawURLEncoding.EncodeToString(ts),
-		Sig:       base64.RawURLEncoding.EncodeToString(sig),
 	})
 }
 
 func (c *Client) postAnswer(ctx context.Context, remotePubkey, answerSdp string, challenge []byte, offerSdp string) error {
 	ts := currentTsBytes()
-	sig := ed25519.Sign(c.opts.PrivateKey, answerPayload(challenge, ts, offerSdp, answerSdp))
-	return c.send(ctx, remotePubkey, wireMessage{
+	return c.signAndSend(ctx, remotePubkey, answerPayload(challenge, ts, offerSdp, answerSdp), wireMessage{
 		From:      c.Pubkey(),
 		Data:      answerSdp,
 		Challenge: base64.RawURLEncoding.EncodeToString(challenge),
 		Ts:        base64.RawURLEncoding.EncodeToString(ts),
-		Sig:       base64.RawURLEncoding.EncodeToString(sig),
 	})
 }
 
-func (c *Client) postICE(ctx context.Context, remotePubkey, candidateJson string, challenge []byte) error {
-	sig := ed25519.Sign(c.opts.PrivateKey, icePayload(challenge, candidateJson))
-	return c.send(ctx, remotePubkey, wireMessage{
+func (c *Client) postICE(ctx context.Context, remotePubkey, candidateJSON string, challenge []byte) error {
+	return c.signAndSend(ctx, remotePubkey, icePayload(challenge, candidateJSON), wireMessage{
 		From:      c.Pubkey(),
-		Data:      candidateJson,
+		Data:      candidateJSON,
 		Challenge: base64.RawURLEncoding.EncodeToString(challenge),
-		Sig:       base64.RawURLEncoding.EncodeToString(sig),
 	})
 }
 
@@ -399,13 +358,8 @@ func (c *Client) send(ctx context.Context, remotePubkey string, msg wireMessage)
 	}
 	body := base64.RawURLEncoding.EncodeToString(b)
 	if c.opts.OnSignal != nil {
-		c.opts.OnSignal(SignalEvent{
-			Direction:    SignalOutboundPOST,
-			RemotePubkey: remotePubkey,
-			Payload:      body,
-		})
+		c.opts.OnSignal(SignalEvent{SignalOutboundPOST, remotePubkey, body})
 	}
-
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.opts.ServerURL+"/"+remotePubkey, strings.NewReader(body))
 	if err != nil {
@@ -422,151 +376,97 @@ func (c *Client) send(ctx context.Context, remotePubkey string, msg wireMessage)
 	return nil
 }
 
-func (c *Client) createAndSendOffer(ctx context.Context, remotePubkey string, state *connState, challenge []byte) error {
-	pc := state.pc
-	if pc.RemoteDescription() != nil {
-		return nil
-	}
-	offer, err := pc.CreateOffer(nil)
-	if err != nil {
-		return err
-	}
-	if err := pc.SetLocalDescription(offer); err != nil {
-		return err
-	}
-	desc := pc.LocalDescription()
-	if desc == nil {
-		return fmt.Errorf("no local description after creating offer")
-	}
-	state.setOfferSdp(desc.SDP)
-	if err := c.postOffer(ctx, remotePubkey, desc.SDP, challenge, currentTsBytes()); err != nil {
-		return err
-	}
-	state.releaseICE()
-	return nil
-}
-
-// handleOffer verifies timestamp and signature (including recipient binding),
-// creates a PC, calls onIncoming, negotiates an answer, then sends the answer.
-// AcceptConnection filtering is done by the caller before this is invoked.
-func (c *Client) handleOffer(ctx context.Context, msg wireMessage, challenge []byte) (*webrtc.PeerConnection, error) {
+// handleOffer verifies an incoming offer, checks AcceptConnection, creates a
+// PC, and sends an answer. Silently returns on any verification failure.
+// AcceptConnection is called after signature verification to prevent untrusted
+// pubkeys from driving policy decisions.
+func (c *Client) handleOffer(ctx context.Context, msg wireMessage, challenge []byte) {
 	tsBytes, err := base64.RawURLEncoding.DecodeString(msg.Ts)
-	if err != nil {
-		return nil, err
-	}
-	ts := parseTsBytes(tsBytes)
-	if ts == nil {
-		return nil, fmt.Errorf("offer timestamp out of window")
+	if err != nil || parseTsBytes(tsBytes) == nil {
+		return
 	}
 
-	senderKeyBytes, err := base64.RawURLEncoding.DecodeString(msg.From)
+	sender, sigBytes, err := parseSenderAndSig(msg.From, msg.Sig)
 	if err != nil {
-		return nil, err
+		return
+	}
+	if !ed25519.Verify(sender, offerPayload(challenge, tsBytes, c.pubKeyRaw(), msg.Data), sigBytes) {
+		return
 	}
 
-	sigBytes, err := base64.RawURLEncoding.DecodeString(msg.Sig)
-	if err != nil {
-		return nil, err
-	}
-
-	// Recipient binding: own pubkey must appear in the signed payload.
-	if !ed25519.Verify(senderKeyBytes, offerPayload(challenge, ts, c.pubKeyRaw(), msg.Data), sigBytes) {
-		return nil, fmt.Errorf("invalid offer signature from %s", msg.From)
+	if c.opts.AcceptConnection == nil || !c.opts.AcceptConnection(msg.From) {
+		return
 	}
 
 	pc, releaseICE, err := c.makePC(ctx, msg.From, challenge)
 	if err != nil {
-		fmt.Println("error creating peer connection:", err)
-		return nil, err
+		return
 	}
 
 	if c.opts.OnIncoming != nil {
 		c.opts.OnIncoming(pc, msg.From)
 	}
 
-	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
-		Type: webrtc.SDPTypeOffer, SDP: msg.Data,
-	}); err != nil {
-		return pc, err
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: msg.Data}); err != nil {
+		pc.Close()
+		return
 	}
-
 	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
-		return pc, err
+		pc.Close()
+		return
 	}
 	if err := pc.SetLocalDescription(answer); err != nil {
-		return pc, err
+		pc.Close()
+		return
 	}
 	desc := pc.LocalDescription()
 	if desc == nil {
-		return pc, fmt.Errorf("no local description after answer")
+		pc.Close()
+		return
 	}
-
 	if err := c.postAnswer(ctx, msg.From, desc.SDP, challenge, msg.Data); err != nil {
-		return pc, err
+		pc.Close()
+		return
 	}
 	releaseICE()
-	return pc, nil
+	c.conns.Store(makeConnKey(msg.From, challenge), &connState{pc: pc})
 }
 
 // handleAnswer verifies timestamp and signature (covering the full offer SDP),
-// then applies the remote description. Returns an error on any verification
-// failure — the caller is responsible for closing the PC.
+// then applies the remote description. Returns an error on any failure.
 func (c *Client) handleAnswer(state *connState, msg wireMessage, challenge []byte) error {
-	pc := state.pc
 	tsBytes, err := base64.RawURLEncoding.DecodeString(msg.Ts)
-	if err != nil {
-		return fmt.Errorf("decoding answer timestamp: %w", err)
+	if err != nil || parseTsBytes(tsBytes) == nil {
+		return fmt.Errorf("answer timestamp invalid or out of window")
 	}
-	ts := parseTsBytes(tsBytes)
-	if ts == nil {
-		return fmt.Errorf("answer timestamp out of window")
-	}
-
-	offerSdp := state.getOfferSdp()
-	if offerSdp == "" {
+	if state.offerSdp == "" {
 		return fmt.Errorf("no sent offer SDP when verifying answer")
 	}
-
-	senderKeyBytes, err := base64.RawURLEncoding.DecodeString(msg.From)
+	sender, sigBytes, err := parseSenderAndSig(msg.From, msg.Sig)
 	if err != nil {
-		return fmt.Errorf("decoding answer sender key: %w", err)
-	}
-
-	sigBytes, err := base64.RawURLEncoding.DecodeString(msg.Sig)
-	if err != nil {
-		return fmt.Errorf("decoding answer signature: %w", err)
-	}
-	if !ed25519.Verify(senderKeyBytes, answerPayload(challenge, ts, offerSdp, msg.Data), sigBytes) {
-		return fmt.Errorf("invalid answer signature from %s", msg.From)
-	}
-
-	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
-		Type: webrtc.SDPTypeAnswer, SDP: msg.Data,
-	}); err != nil {
 		return err
 	}
-	state.resolveAuth()
+	if !ed25519.Verify(sender, answerPayload(challenge, tsBytes, state.offerSdp, msg.Data), sigBytes) {
+		return fmt.Errorf("invalid answer signature from %s", msg.From)
+	}
+	if err := state.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: msg.Data}); err != nil {
+		return err
+	}
+	sendAuth(state.authDone, nil)
 	return nil
 }
 
-// handleICE verifies the ICE candidate signature, then adds the candidate.
-// Returns an error on any verification failure — the caller is responsible
-// for closing the PC.
+// handleICE verifies the ICE candidate signature and adds the candidate.
+// Returns an error on any failure.
 func (c *Client) handleICE(pc *webrtc.PeerConnection, msg wireMessage, challenge []byte) error {
-	senderKeyBytes, err := base64.RawURLEncoding.DecodeString(msg.From)
+	sender, sigBytes, err := parseSenderAndSig(msg.From, msg.Sig)
 	if err != nil {
-		return fmt.Errorf("decoding ICE sender key: %w", err)
+		return err
 	}
-
-	sigBytes, err := base64.RawURLEncoding.DecodeString(msg.Sig)
-	if err != nil {
-		return fmt.Errorf("decoding ICE signature: %w", err)
-	}
-	if !ed25519.Verify(senderKeyBytes, icePayload(challenge, msg.Data), sigBytes) {
+	if !ed25519.Verify(sender, icePayload(challenge, msg.Data), sigBytes) {
 		return fmt.Errorf("invalid ICE signature from %s", msg.From)
 	}
-
 	var init webrtc.ICECandidateInit
 	if err := json.Unmarshal([]byte(msg.Data), &init); err != nil {
 		return fmt.Errorf("parsing ICE candidate: %w", err)
@@ -576,7 +476,7 @@ func (c *Client) handleICE(pc *webrtc.PeerConnection, msg wireMessage, challenge
 
 // Listen opens an authenticated SSE stream and delivers incoming messages
 // until ctx is cancelled. It reconnects automatically on transient failures.
-// Returns ctx.Err() when ctx is cancelled, or an error on setup failure.
+// Returns ctx.Err() when ctx is cancelled.
 func (c *Client) Listen(ctx context.Context) error {
 	path := "/" + c.Pubkey()
 	backoff := time.Duration(reconnectBaseMS) * time.Millisecond
@@ -590,10 +490,10 @@ func (c *Client) Listen(ctx context.Context) error {
 				return
 			case <-ticker.C:
 				c.conns.Range(func(k, v any) bool {
-					switch v.(*connState).pc.ConnectionState() {
-					case webrtc.PeerConnectionStateFailed,
-						webrtc.PeerConnectionStateClosed:
-						v.(*connState).rejectAuth(fmt.Errorf("peer connection closed before authentication"))
+					state := v.(*connState)
+					switch state.pc.ConnectionState() {
+					case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
+						sendAuth(state.authDone, fmt.Errorf("peer connection closed before authentication"))
 						c.conns.Delete(k)
 					}
 					return true
@@ -606,7 +506,6 @@ func (c *Client) Listen(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-
 		err := c.connectSSE(ctx, path)
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -616,7 +515,6 @@ func (c *Client) Listen(ctx context.Context) error {
 		} else {
 			backoff = min(backoff*2, reconnectMaxMS*time.Millisecond)
 		}
-
 		jitter := time.Duration(mathrand.IntN(1000)) * time.Millisecond
 		select {
 		case <-ctx.Done():
@@ -659,21 +557,13 @@ func (c *Client) connectSSE(ctx context.Context, path string) error {
 		}
 		payload := line[len("data: "):]
 		if c.opts.OnSignal != nil {
-			c.opts.OnSignal(SignalEvent{
-				Direction:    SignalInboundSSE,
-				RemotePubkey: c.Pubkey(),
-				Payload:      payload,
-			})
+			c.opts.OnSignal(SignalEvent{SignalInboundSSE, c.Pubkey(), payload})
 		}
 		if err := c.handleSSEMessage(ctx, payload); err != nil {
 			return err
 		}
 	}
-
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-	return nil
+	return scanner.Err()
 }
 
 func (c *Client) handleSSEMessage(ctx context.Context, line string) error {
@@ -681,7 +571,6 @@ func (c *Client) handleSSEMessage(ctx context.Context, line string) error {
 	if err != nil {
 		return nil
 	}
-
 	var msg wireMessage
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		return nil
@@ -689,7 +578,6 @@ func (c *Client) handleSSEMessage(ctx context.Context, line string) error {
 	if msg.From == "" || msg.Data == "" || msg.Challenge == "" || msg.Sig == "" {
 		return nil
 	}
-
 	challenge, err := base64.RawURLEncoding.DecodeString(msg.Challenge)
 	if err != nil || len(challenge) != 32 {
 		return nil
@@ -698,32 +586,21 @@ func (c *Client) handleSSEMessage(ctx context.Context, line string) error {
 	key := makeConnKey(msg.From, challenge)
 	val, known := c.conns.Load(key)
 	if !known {
-		if c.opts.AcceptConnection == nil || !c.opts.AcceptConnection(msg.From) {
-			return nil
-		}
-		pc, err := c.handleOffer(ctx, msg, challenge)
-		if err != nil {
-			if pc != nil {
-				pc.Close()
-			}
-		} else {
-			c.conns.Store(makeConnKey(msg.From, challenge), &connState{pc: pc})
-		}
-	} else {
-		state := val.(*connState)
-		pc := state.pc
-		if pc.RemoteDescription() == nil {
-			// No remote description, this is an answer to an offer we sent.
-			if err := c.handleAnswer(state, msg, challenge); err != nil {
-				c.closeConnWithError(key, state, err)
-			}
-		} else {
-			// Remote description already set, this must be an ICE candidate.
-			if err := c.handleICE(pc, msg, challenge); err != nil {
-				c.closeConnWithError(key, state, err)
-			}
-		}
+		c.handleOffer(ctx, msg, challenge)
+		return nil
 	}
 
+	state := val.(*connState)
+	if state.pc.RemoteDescription() == nil {
+		// Known session with no remote description: this is an answer to our offer.
+		if err := c.handleAnswer(state, msg, challenge); err != nil {
+			c.closeConnWithError(key, state, err)
+		}
+	} else {
+		// Remote description already set: this must be an ICE candidate.
+		if err := c.handleICE(state.pc, msg, challenge); err != nil {
+			c.closeConnWithError(key, state, err)
+		}
+	}
 	return nil
 }

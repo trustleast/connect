@@ -30,7 +30,7 @@ func main() {
 }
 
 func run() error {
-	serverURL := flag.String("server-url", getenv("CONNECT_URL", "http://localhost:8080"), "connect relay URL")
+	serverURL := flag.String("server-url", getenv("CONNECT_URL", "https://connect.peerwave.ai"), "connect relay URL")
 	timeout := flag.Duration("timeout", 30*time.Second, "overall spec timeout")
 	dialTimeout := flag.Duration("dial-timeout", 10*time.Second, "per-dial signaling timeout")
 	flag.Parse()
@@ -439,24 +439,23 @@ func senderAndSig(msg wireMessage) (ed25519.PublicKey, []byte, error) {
 }
 
 func dialBack(ctx context.Context, client *connect.Client, remotePubkey string, timeout time.Duration) error {
+	dialCtx, dialCancel := context.WithTimeout(ctx, timeout)
+	defer dialCancel()
 	done := make(chan error, 1)
-	pc, err := client.Dial(ctx, remotePubkey,
-		connect.WithDialTimeout(timeout),
-		connect.WithDialSetup(func(pc *webrtc.PeerConnection) {
-			label, err := randomChannelLabel()
-			if err != nil {
-				done <- err
-				return
-			}
-			fmt.Fprintf(os.Stderr, "creating outbound-leg tester data channel label=%s\n", label)
-			dc, err := pc.CreateDataChannel(label, nil)
-			if err != nil {
-				done <- fail("connection-flow.outbound.datachannel.create", "create data channel: %v", err)
-				return
-			}
-			wireChallenge(dc, done)
-		}),
-	)
+	pc, err := client.Dial(dialCtx, remotePubkey, func(pc *webrtc.PeerConnection) {
+		label, err := randomChannelLabel()
+		if err != nil {
+			done <- err
+			return
+		}
+		fmt.Fprintf(os.Stderr, "creating outbound-leg tester data channel label=%s\n", label)
+		dc, err := pc.CreateDataChannel(label, nil)
+		if err != nil {
+			done <- fail("connection-flow.outbound.datachannel.create", "create data channel: %v", err)
+			return
+		}
+		wireChallenge(dc, done)
+	})
 	if err != nil {
 		return fail("connection-flow.outbound.signaling-auth", "dial back signaling/auth failed: %v", err)
 	}
