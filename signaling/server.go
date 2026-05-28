@@ -31,6 +31,15 @@ var (
 	sseSuffix    = []byte("\n\n")
 	sseKeepalive = []byte(": ka\n\n")
 
+	// sseResponse is written to the hijacked connection immediately after auth.
+	sseResponse = []byte("HTTP/1.1 200 OK\r\n" +
+		"Content-Type: text/event-stream\r\n" +
+		"Cache-Control: no-cache\r\n" +
+		"Connection: keep-alive\r\n" +
+		"Access-Control-Allow-Origin: *\r\n" +
+		"X-Accel-Buffering: no\r\n" +
+		"\r\n")
+
 	errMissingSignature       = errors.New("missing ?sig= query param")
 	errInvalidEncoding        = errors.New("invalid encoding")
 	errInvalidSignatureLength = errors.New("invalid signature length")
@@ -194,13 +203,8 @@ func verifyAuth(rawSignature string, pubkey ed25519.PublicKey) error {
 
 // --- SSE -----------------------------------------------------------------
 
-// listenForMessages streams messages to the client that owns pubkey.
-// The client proves ownership by signing the request timestamp.
-//
-//	GET /{pubkey}
-//	X-Signature: base64(sig || ts)
-//
-// Keep-alives are SSE comments (": ka") sent every 20 s.
+// listenForMessages hijacks the connection after auth, writes the SSE response
+// headers, registers with the hub, and returns — freeing the handler goroutine.
 func (s *server) listenForMessages(w http.ResponseWriter, r *http.Request, pubkeyStr string) {
 	pubkey, err := decodePubKey(pubkeyStr)
 	if err != nil {
@@ -219,28 +223,24 @@ func (s *server) listenForMessages(w http.ResponseWriter, r *http.Request, pubke
 		return
 	}
 
-	fl, ok := w.(http.Flusher)
+	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
 
-	// Disable the write deadline for this SSE connection — it streams
-	// indefinitely and must not be killed by the server's WriteTimeout.
-	// The server WriteTimeout still applies to POST requests.
-	if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil {
-		http.Error(w, "failed to configure stream", http.StatusInternalServerError)
+	nc, brw, err := hj.Hijack()
+	if err != nil {
+		http.Error(w, "failed to acquire connection", http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	fl.Flush() // send headers immediately so the client unblocks
+	if _, err := brw.Write(sseResponse); err != nil || brw.Flush() != nil {
+		nc.Close()
+		return
+	}
 
-	s.hub.register(r.Context(), pubkeyStr, w, fl.Flush)
+	s.hub.register(pubkeyStr, nc)
 }
 
 // --- Message -------------------------------------------------------------

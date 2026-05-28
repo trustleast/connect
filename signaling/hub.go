@@ -2,7 +2,7 @@ package connect
 
 import (
 	"context"
-	"net/http"
+	"net"
 	"sync"
 	"time"
 )
@@ -17,17 +17,15 @@ type hub struct {
 	clients sync.Map // map[string]*conn
 }
 
-// conn holds the live SSE writer for a single pubkey.
+// conn holds the hijacked TCP connection for a single pubkey.
 type conn struct {
-	mu        sync.Mutex
-	w         http.ResponseWriter
-	flush     func()
-	displaced chan struct{} // closed when a newer registration takes over
+	mu sync.Mutex
+	nc net.Conn
 }
 
 // newHub creates a hub and starts a single shared keepalive ticker that sends
 // SSE keep-alive comments to all active connections. The ticker runs until ctx
-// is cancelled.
+// is cancelled, at which point all connections are closed.
 func newHub(ctx context.Context) *hub {
 	h := &hub{}
 	go h.keepalive(ctx)
@@ -40,40 +38,43 @@ func (h *hub) keepalive(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			h.clients.Range(func(k, val any) bool {
+				c := val.(*conn)
+				if h.clients.CompareAndDelete(k, c) {
+					c.nc.Close()
+				}
+				return true
+			})
 			return
 		case <-tick.C:
-			h.clients.Range(func(_, val any) bool {
+			h.clients.Range(func(k, val any) bool {
 				c := val.(*conn)
 				c.mu.Lock()
-				c.w.Write(sseKeepalive)
-				c.flush()
+				_, err := c.nc.Write(sseKeepalive)
 				c.mu.Unlock()
+				if err != nil {
+					if h.clients.CompareAndDelete(k, c) {
+						c.nc.Close()
+					}
+				}
 				return true
 			})
 		}
 	}
 }
 
-// register stores conn for pubkey, displacing any existing connection, then
-// blocks until ctx is done or the connection is displaced by a newer one. On
-// return the conn is removed from the hub. Callers should not use w or fl
-// after register returns.
-func (h *hub) register(ctx context.Context, pubkey string, w http.ResponseWriter, flush func()) {
-	c := &conn{w: w, flush: flush, displaced: make(chan struct{})}
+// register stores nc for pubkey and closes any displaced connection.
+// It returns immediately; the caller's goroutine is freed.
+func (h *hub) register(pubkey string, nc net.Conn) {
+	c := &conn{nc: nc}
 	if old, ok := h.clients.Swap(pubkey, c); ok {
-		close(old.(*conn).displaced)
-	}
-
-	select {
-	case <-ctx.Done():
-		h.clients.CompareAndDelete(pubkey, c)
-	case <-c.displaced:
-		// already replaced in the map by the new registration
+		old.(*conn).nc.Close()
 	}
 }
 
-// deliver writes data directly into the SSE stream registered under pubkey.
-// Returns false if pubkey has no active connection.
+// deliver writes data into the SSE stream registered under pubkey using a
+// single vectored write. Returns false if pubkey has no active connection or
+// the write fails.
 func (h *hub) deliver(pubkey string, data []byte) bool {
 	val, ok := h.clients.Load(pubkey)
 	if !ok {
@@ -81,10 +82,14 @@ func (h *hub) deliver(pubkey string, data []byte) bool {
 	}
 	c := val.(*conn)
 	c.mu.Lock()
-	c.w.Write(ssePrefix)
-	c.w.Write(data)
-	c.w.Write(sseSuffix)
-	c.flush()
+	bufs := net.Buffers{ssePrefix, data, sseSuffix}
+	_, err := bufs.WriteTo(c.nc)
 	c.mu.Unlock()
+	if err != nil {
+		if h.clients.CompareAndDelete(pubkey, c) {
+			c.nc.Close()
+		}
+		return false
+	}
 	return true
 }
