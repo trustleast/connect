@@ -1,7 +1,8 @@
 go 1.24
 
 use (
-	.
-	./cmd/server
+	./signaling
+	./signaling/cmd/server
+	./connect-http-bridge
 	./goclient
 )
