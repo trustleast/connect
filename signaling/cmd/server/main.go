@@ -23,7 +23,6 @@ import (
 	ec2svc "github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/valyala/fasthttp"
 
 	"connect"
 )
@@ -74,7 +73,6 @@ func main() {
 	nodeURL := flag.String("node-url", "", "this node's base URL for peer routing, e.g. https://node-abc123.example.com")
 	zoneName := flag.String("zone-name", "", "DNS zone name used to derive peer node URLs from IPv6 addresses, e.g. peerwave.ai")
 	debugAddr := flag.String("debug-addr", "", "optional address for debug/runtime HTTP endpoint, e.g. 127.0.0.1:18090")
-	useFastHTTP := flag.Bool("fasthttp", false, "use fasthttp instead of net/http (lower allocations per request)")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -130,61 +128,30 @@ func main() {
 	ln := &sizingListener{Listener: rawLn}
 	log.Println("Listening on: ", ln.Addr())
 
-	if *useFastHTTP {
-		fs := connect.NewFastServer(ctx, connectCfg)
-		fhSrv := &fasthttp.Server{
-			Handler:            fs.Handler,
-			ReadTimeout:        10 * time.Second,
-			WriteTimeout:       0,
-			IdleTimeout:        60 * time.Second,
-			MaxRequestBodySize: 4 << 10, // 4 KiB
-			// KeepHijackedConns prevents fasthttp from closing the underlying
-			// net.Conn after our SSE hijack handler returns. The hub owns the
-			// connection lifetime from that point.
-			KeepHijackedConns: true,
+	httpSrv := &http.Server{
+		Addr:    *addr,
+		Handler: connect.NewServer(ctx, connectCfg),
+		// Disable HTTP/2: ServeTLS enables it automatically via ALPN, but
+		// hijacking (required for SSE) is not available on HTTP/2 streams.
+		TLSNextProto:      make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      0,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 10, // 1 KiB
+	}
+	if cfg.Cert != "" {
+		tlsCfg, err := buildTLS(cfg.Cert, cfg.Key)
+		if err != nil {
+			log.Fatalf("building TLS config: %v", err)
 		}
-		if cfg.Cert != "" {
-			tlsCfg, err := buildTLS(cfg.Cert, cfg.Key)
-			if err != nil {
-				log.Fatalf("building TLS config: %v", err)
-			}
-			tlsLn := tls.NewListener(ln, tlsCfg)
-			log.Println("fasthttp: serving HTTPS")
-			if err := fhSrv.Serve(tlsLn); err != nil {
-				log.Fatalf("fasthttp serving HTTPS: %v", err)
-			}
-		} else {
-			log.Println("fasthttp: serving HTTP")
-			if err := fhSrv.Serve(ln); err != nil {
-				log.Fatalf("fasthttp serving: %v", err)
-			}
+		httpSrv.TLSConfig = tlsCfg
+		if err := httpSrv.ServeTLS(ln, "", ""); err != nil {
+			log.Fatalf("serving HTTPS: %v\n", err)
 		}
 	} else {
-		httpSrv := &http.Server{
-			Addr:    *addr,
-			Handler: connect.NewServer(ctx, connectCfg),
-			// Disable HTTP/2: ServeTLS enables it automatically via ALPN, but
-			// hijacking (required for SSE) is not available on HTTP/2 streams.
-			TLSNextProto:      make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
-			ReadHeaderTimeout: 5 * time.Second,
-			ReadTimeout:       10 * time.Second,
-			WriteTimeout:      0,
-			IdleTimeout:       60 * time.Second,
-			MaxHeaderBytes:    1 << 10, // 1 KiB
-		}
-		if cfg.Cert != "" {
-			tlsCfg, err := buildTLS(cfg.Cert, cfg.Key)
-			if err != nil {
-				log.Fatalf("building TLS config: %v", err)
-			}
-			httpSrv.TLSConfig = tlsCfg
-			if err := httpSrv.ServeTLS(ln, "", ""); err != nil {
-				log.Fatalf("serving HTTPS: %v\n", err)
-			}
-		} else {
-			if err := httpSrv.Serve(ln); err != nil {
-				log.Fatalf("serving: %v\n", err)
-			}
+		if err := httpSrv.Serve(ln); err != nil {
+			log.Fatalf("serving: %v\n", err)
 		}
 	}
 	log.Println("server stopped")
