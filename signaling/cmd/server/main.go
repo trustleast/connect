@@ -12,6 +12,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -21,9 +23,41 @@ import (
 	ec2svc "github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/valyala/fasthttp"
 
 	"connect"
 )
+
+const (
+	// _AcceptRcvBuf is the receive buffer set on every accepted connection.
+	// Large enough to receive request headers + a max-size body in one shot.
+	// SSE connections have this reduced to the kernel minimum after hijack
+	// since they receive nothing after the initial GET.
+	_AcceptRcvBuf = 4 << 10 // 4 KiB
+
+	// _AcceptSndBuf is the send buffer set on every accepted connection.
+	// POST responses are ~300 B; the SSE upgrade response is ~100 B.
+	// SSE connections have this raised to _FrameSize after hijack.
+	_AcceptSndBuf = 2 << 10 // 2 KiB
+)
+
+// sizingListener wraps a net.Listener and sets tight socket buffers on every
+// accepted TCP connection before the HTTP layer sees it.
+type sizingListener struct {
+	net.Listener
+}
+
+func (l *sizingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	if tc, ok := c.(*net.TCPConn); ok {
+		tc.SetReadBuffer(_AcceptRcvBuf)  //nolint:errcheck
+		tc.SetWriteBuffer(_AcceptSndBuf) //nolint:errcheck
+	}
+	return c, nil
+}
 
 // instanceConfig is the JSON structure stored in the SSM config parameter.
 type instanceConfig struct {
@@ -39,9 +73,15 @@ func main() {
 	awsRegion := flag.String("aws-region", "", "AWS region (required when running in environments without IMDSv2, e.g. NanoVMs)")
 	nodeURL := flag.String("node-url", "", "this node's base URL for peer routing, e.g. https://node-abc123.example.com")
 	zoneName := flag.String("zone-name", "", "DNS zone name used to derive peer node URLs from IPv6 addresses, e.g. peerwave.ai")
+	debugAddr := flag.String("debug-addr", "", "optional address for debug/runtime HTTP endpoint, e.g. 127.0.0.1:18090")
+	useFastHTTP := flag.Bool("fasthttp", false, "use fasthttp instead of net/http (lower allocations per request)")
 	flag.Parse()
 
 	ctx := context.Background()
+
+	if *debugAddr != "" {
+		startDebugServer(*debugAddr)
+	}
 
 	var cfg instanceConfig
 	if *configS3 != "" {
@@ -68,47 +108,83 @@ func main() {
 		peerFinder = pf
 	}
 
-	httpSrv := &http.Server{
-		Addr: *addr,
-		Handler: connect.NewServer(ctx, connect.Config{
-			PeerFinder: peerFinder,
-			NodeURL:    *nodeURL,
-		}),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      0,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    1 << 10, // 1 KiB
-		// Disable HTTP/2: ServeTLS enables it automatically via ALPN, but
-		// hijacking (required for SSE) is not available on HTTP/2 streams.
-		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
+	connectCfg := connect.Config{
+		PeerFinder: peerFinder,
+		NodeURL:    *nodeURL,
 	}
 
-	// Bind directly to a single interface instead of relying on dual-stack to minimize resource utilization.
-	//
-	ln, err := net.Listen(*network, *addr)
+	lc := net.ListenConfig{
+		Control: listenControl,
+	}
+	rawLn, err := lc.Listen(ctx, *network, *addr)
 	if err != nil {
 		log.Fatalf("listen %s %s: %v", *network, *addr, err)
 	}
-
+	// Wrap the listener to set tight socket buffers on every accepted connection
+	// before the HTTP handshake begins. We know the traffic shape precisely:
+	//   rcvbuf=_AcceptRcvBuf: large enough for request headers + a max-size body
+	//                         (SDP ~1.5 KB base64, ICE ~300 B, hard cap 4 KB).
+	//   sndbuf=_AcceptSndBuf: large enough for any POST response (~300 B) and
+	//                         the SSE upgrade response (~100 B). SSE connections
+	//                         have their sndbuf raised to _FrameSize after hijack.
+	ln := &sizingListener{Listener: rawLn}
 	log.Println("Listening on: ", ln.Addr())
 
-	if cfg.Cert != "" {
-		var tlsCfg *tls.Config
+	if *useFastHTTP {
+		fs := connect.NewFastServer(ctx, connectCfg)
+		fhSrv := &fasthttp.Server{
+			Handler:            fs.Handler,
+			ReadTimeout:        10 * time.Second,
+			WriteTimeout:       0,
+			IdleTimeout:        60 * time.Second,
+			MaxRequestBodySize: 4 << 10, // 4 KiB
+			// KeepHijackedConns prevents fasthttp from closing the underlying
+			// net.Conn after our SSE hijack handler returns. The hub owns the
+			// connection lifetime from that point.
+			KeepHijackedConns: true,
+		}
 		if cfg.Cert != "" {
-			var err error
-			tlsCfg, err = buildTLS(cfg.Cert, cfg.Key)
+			tlsCfg, err := buildTLS(cfg.Cert, cfg.Key)
 			if err != nil {
 				log.Fatalf("building TLS config: %v", err)
 			}
-		}
-		httpSrv.TLSConfig = tlsCfg
-		if err := httpSrv.ServeTLS(ln, "", ""); err != nil {
-			log.Fatalf("serving HTTPS: %v\n", err)
+			tlsLn := tls.NewListener(ln, tlsCfg)
+			log.Println("fasthttp: serving HTTPS")
+			if err := fhSrv.Serve(tlsLn); err != nil {
+				log.Fatalf("fasthttp serving HTTPS: %v", err)
+			}
+		} else {
+			log.Println("fasthttp: serving HTTP")
+			if err := fhSrv.Serve(ln); err != nil {
+				log.Fatalf("fasthttp serving: %v", err)
+			}
 		}
 	} else {
-		if err := httpSrv.Serve(ln); err != nil {
-			log.Fatalf("serving: %v\n", err)
+		httpSrv := &http.Server{
+			Addr:    *addr,
+			Handler: connect.NewServer(ctx, connectCfg),
+			// Disable HTTP/2: ServeTLS enables it automatically via ALPN, but
+			// hijacking (required for SSE) is not available on HTTP/2 streams.
+			TLSNextProto:      make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       10 * time.Second,
+			WriteTimeout:      0,
+			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    1 << 10, // 1 KiB
+		}
+		if cfg.Cert != "" {
+			tlsCfg, err := buildTLS(cfg.Cert, cfg.Key)
+			if err != nil {
+				log.Fatalf("building TLS config: %v", err)
+			}
+			httpSrv.TLSConfig = tlsCfg
+			if err := httpSrv.ServeTLS(ln, "", ""); err != nil {
+				log.Fatalf("serving HTTPS: %v\n", err)
+			}
+		} else {
+			if err := httpSrv.Serve(ln); err != nil {
+				log.Fatalf("serving: %v\n", err)
+			}
 		}
 	}
 	log.Println("server stopped")
@@ -254,4 +330,37 @@ func ipNodeURL(ip, zoneName, scheme string) string {
 	canonical := net.ParseIP(ip).String()
 	h := sha256.Sum256([]byte(canonical))
 	return fmt.Sprintf("%s://node-%s.%s", scheme, hex.EncodeToString(h[:4]), zoneName)
+}
+
+// startDebugServer binds a local-only HTTP server that exposes Go runtime
+// memory stats as JSON for sse-memprobe's -server-debug-url flag.
+// Listens on addr (e.g. "127.0.0.1:18090") and never serves externally.
+func startDebugServer(addr string) {
+	mux := http.NewServeMux()
+	mux.Handle("/debug/pprof/", http.DefaultServeMux) // registered by net/http/pprof init
+	mux.HandleFunc("/debug/runtime", func(w http.ResponseWriter, r *http.Request) {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(struct {
+			Goroutines int    `json:"goroutines"`
+			HeapAlloc  uint64 `json:"heap_alloc"`
+			HeapSys    uint64 `json:"heap_sys"`
+			StackInuse uint64 `json:"stack_inuse"`
+			Sys        uint64 `json:"sys"`
+		}{
+			Goroutines: runtime.NumGoroutine(),
+			HeapAlloc:  m.HeapAlloc,
+			HeapSys:    m.HeapSys,
+			StackInuse: m.StackInuse,
+			Sys:        m.Sys,
+		})
+	})
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("debug server: %v", err)
+		}
+	}()
+	log.Printf("debug server listening on %s", addr)
 }

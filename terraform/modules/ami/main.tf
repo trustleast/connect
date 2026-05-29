@@ -48,6 +48,8 @@ resource "local_file" "ops_json" {
     }
     ManifestPassthrough = {
       exec_wait_for_ip6_secs = "5"
+      so_rcvbuf              = "8192"
+      so_sndbuf              = "8192"
     }
     CloudConfig = {
       Platform   = "aws"

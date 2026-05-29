@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -33,9 +35,31 @@ var (
 	// Must match the tag used by all client implementations.
 	sseAuthDomain = []byte("connect.sse.v1\x00")
 
+	// Auth pools — eliminate per-request heap allocations on the SSE connect path.
+
+	// pubkeyDecodePool holds 32-byte buffers for base64-decoding ed25519 public keys.
+	// Callers must not retain a reference after returning the buffer to the pool.
+	pubkeyDecodePool = sync.Pool{New: func() any { b := make([]byte, ed25519.PublicKeySize); return &b }}
+
+	// authDecodePool holds _AuthMessageSize-byte buffers for base64-decoding the
+	// sig query parameter (sig[64] || ts[8]).
+	authDecodePool = sync.Pool{New: func() any { b := make([]byte, _AuthMessageSize); return &b }}
+
+	// authMsgPool holds the ed25519 message buffer pre-filled with sseAuthDomain.
+	// Only the trailing 8 timestamp bytes are overwritten per request.
+	authMsgPool = sync.Pool{New: func() any {
+		b := make([]byte, len(sseAuthDomain)+8)
+		copy(b, sseAuthDomain)
+		return &b
+	}}
+
 	ssePrefix    = []byte("data: ")
 	sseSuffix    = []byte("\n\n")
 	sseKeepalive = []byte(": ka\n\n")
+
+	// corsOriginAny is pre-allocated to avoid a []string alloc on every POST response.
+	// Safe to share: net/http reads header values but never mutates them after WriteHeader.
+	corsOriginAny = []string{"*"}
 
 	// sseResponse is written to the hijacked connection immediately after auth.
 	sseResponse = []byte("HTTP/1.1 200 OK\r\n" +
@@ -133,10 +157,11 @@ func (s *server) targetPeer(pubkeyStr string) string {
 //	GET  /{pubkey}  — open SSE stream (client proves ownership)
 //	POST /{pubkey}  — deliver an opaque payload to that pubkey
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST")
-	w.Header().Set("Access-Control-Allow-Headers", "X-Signature, Content-Type")
 	if r.Method == http.MethodOptions {
+		h := w.Header()
+		h.Set("Access-Control-Allow-Origin", "*")
+		h.Set("Access-Control-Allow-Methods", "GET, POST")
+		h.Set("Access-Control-Allow-Headers", "Content-Type")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -156,6 +181,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		s.listenForMessages(w, r, pubKey)
 	case http.MethodPost:
+		// POST responses require Access-Control-Allow-Origin for cross-origin clients.
+		// Allow-Methods and Allow-Headers are only checked by browsers on OPTIONS preflight.
+		w.Header()["Access-Control-Allow-Origin"] = corsOriginAny
 		s.postMessage(w, r, pubKey)
 	default:
 		http.NotFound(w, r)
@@ -174,6 +202,20 @@ func decodePubKey(s string) (ed25519.PublicKey, error) {
 	return ed25519.PublicKey(b), nil
 }
 
+// decodePubKeyInto decodes a base64url-encoded ed25519 public key into dst.
+// dst must be at least ed25519.PublicKeySize bytes. The returned PublicKey
+// aliases dst — the caller must not return dst to a pool while the key is live.
+func decodePubKeyInto(src, dst []byte) (ed25519.PublicKey, error) {
+	n, err := base64.RawURLEncoding.Decode(dst, src)
+	if err != nil {
+		return nil, fmt.Errorf("base64 decode: %w", err)
+	}
+	if n != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("expected %d bytes, got %d", ed25519.PublicKeySize, n)
+	}
+	return ed25519.PublicKey(dst[:n]), nil
+}
+
 // verifyAuth checks that the request carries a valid ed25519 signature from
 // pubkey.
 //
@@ -184,25 +226,39 @@ func decodePubKey(s string) (ed25519.PublicKey, error) {
 //
 // sig = ed25519_sign(privkey, sseAuthDomain || ts), ts is an 8-byte
 // big-endian uint64 unix timestamp, must be within ±60 s of server time.
-func verifyAuth(rawSignature string, pubkey ed25519.PublicKey) error {
-	raw, err := base64.RawURLEncoding.DecodeString(rawSignature)
+//
+// rawSig is the raw base64url bytes — callers pass the query param or header
+// value directly without converting to string, avoiding an allocation.
+func verifyAuth(rawSig []byte, pubkey ed25519.PublicKey) error {
+	rawp := authDecodePool.Get().(*[]byte)
+	n, err := base64.RawURLEncoding.Decode(*rawp, rawSig)
 	if err != nil {
+		authDecodePool.Put(rawp)
 		return errInvalidEncoding
 	}
-	if len(raw) != _AuthMessageSize {
+	if n != _AuthMessageSize {
+		authDecodePool.Put(rawp)
 		return errInvalidSignatureLength
 	}
 
-	sig := raw[:ed25519.SignatureSize]
-	tsBytes := raw[ed25519.SignatureSize:]
+	sig := (*rawp)[:ed25519.SignatureSize]
+	tsBytes := (*rawp)[ed25519.SignatureSize:n]
 	ts := int64(binary.BigEndian.Uint64(tsBytes))
 
 	delta := time.Now().Unix() - ts
 	if delta < -60 || delta > 2 {
+		authDecodePool.Put(rawp)
 		return fmt.Errorf("timestamp outside window")
 	}
 
-	if !ed25519.Verify(pubkey, append(sseAuthDomain, tsBytes...), sig) {
+	// authMsgPool buffers are pre-filled with sseAuthDomain; only write tsBytes.
+	msgp := authMsgPool.Get().(*[]byte)
+	copy((*msgp)[len(sseAuthDomain):], tsBytes)
+	ok := ed25519.Verify(pubkey, *msgp, sig)
+	authMsgPool.Put(msgp)
+	authDecodePool.Put(rawp)
+
+	if !ok {
 		return fmt.Errorf("signature verification failed")
 	}
 	return nil
@@ -225,7 +281,7 @@ func (s *server) listenForMessages(w http.ResponseWriter, r *http.Request, pubke
 		return
 	}
 
-	if err := verifyAuth(sigStr, pubkey); err != nil {
+	if err := verifyAuth([]byte(sigStr), pubkey); err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
@@ -242,12 +298,40 @@ func (s *server) listenForMessages(w http.ResponseWriter, r *http.Request, pubke
 		return
 	}
 
+	tuneSSEBuffers(nc)
+
 	if _, err := brw.Write(sseResponse); err != nil || brw.Flush() != nil {
 		nc.Close()
 		return
 	}
 
 	s.hub.register(pubkeyStr, nc)
+}
+
+// tuneConnBuffers sets SO_RCVBUF and SO_SNDBUF on a connection, unwrapping
+// TLS if necessary. Best-effort: errors are silently ignored.
+func tuneConnBuffers(nc net.Conn, rcvbuf, sndbuf int) {
+	inner := nc
+	if tlsConn, ok := nc.(*tls.Conn); ok {
+		inner = tlsConn.NetConn()
+	}
+	tc, ok := inner.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	tc.SetReadBuffer(rcvbuf)  //nolint:errcheck
+	tc.SetWriteBuffer(sndbuf) //nolint:errcheck
+}
+
+// tuneSSEBuffers shrinks buffers on a hijacked SSE connection to the minimum
+// viable sizes for a write-only long-lived stream:
+//
+//   - rcvbuf=1: kernel floors to its minimum (~2304 B); the connection is
+//     receive-idle after the handshake so no receive capacity is needed.
+//   - sndbuf=_FrameSize: one max SSE frame fits without blocking; the hub
+//     writes frames sequentially so no larger buffer is needed.
+func tuneSSEBuffers(nc net.Conn) {
+	tuneConnBuffers(nc, 1, _FrameSize)
 }
 
 // --- Message -------------------------------------------------------------
