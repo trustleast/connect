@@ -4,15 +4,17 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -35,24 +37,6 @@ var (
 	// Must match the tag used by all client implementations.
 	sseAuthDomain = []byte("connect.sse.v1\x00")
 
-	// Auth pools — eliminate per-request heap allocations on the SSE connect path.
-
-	// pubkeyDecodePool holds 32-byte buffers for base64-decoding ed25519 public keys.
-	// Callers must not retain a reference after returning the buffer to the pool.
-	pubkeyDecodePool = sync.Pool{New: func() any { b := make([]byte, ed25519.PublicKeySize); return &b }}
-
-	// authDecodePool holds _AuthMessageSize-byte buffers for base64-decoding the
-	// sig query parameter (sig[64] || ts[8]).
-	authDecodePool = sync.Pool{New: func() any { b := make([]byte, _AuthMessageSize); return &b }}
-
-	// authMsgPool holds the ed25519 message buffer pre-filled with sseAuthDomain.
-	// Only the trailing 8 timestamp bytes are overwritten per request.
-	authMsgPool = sync.Pool{New: func() any {
-		b := make([]byte, len(sseAuthDomain)+8)
-		copy(b, sseAuthDomain)
-		return &b
-	}}
-
 	ssePrefix    = []byte("data: ")
 	sseSuffix    = []byte("\n\n")
 	sseKeepalive = []byte(": ka\n\n")
@@ -70,6 +54,8 @@ var (
 		"X-Accel-Buffering: no\r\n" +
 		"\r\n")
 
+	errNodeUnavailable        = errors.New("recipient not connected")
+	errInvalidPubKey          = errors.New("invalid public key")
 	errMissingSignature       = errors.New("missing ?sig= query param")
 	errInvalidEncoding        = errors.New("invalid encoding")
 	errInvalidSignatureLength = errors.New("invalid signature length")
@@ -78,11 +64,17 @@ var (
 // PeerFinder returns the current set of peer node base URLs for pubkey routing.
 // Implementations must be safe for concurrent use.
 //
-// Peers should include this node's own URL. The server uses the sorted list and
-// a hash of the pubkey to select the canonical node for each channel; if the
-// selected node is not this node, the request is redirected.
+// Peers should include this node's own URL. The server uses HRW hashing over the
+// peer set to select the canonical node for each pubkey; requests for keys not
+// owned by this node are redirected to the owner.
 type PeerFinder interface {
-	Peers() []string
+	// Peers returns the current peer set including this node's own URL.
+	Peers() []*url.URL
+	// OnChange returns a channel that receives an empty signal whenever the peer
+	// set changes. The channel is never closed. Callers should re-read Peers()
+	// after receiving a signal. Static implementations allocate the channel but
+	// never send on it.
+	OnChange() <-chan struct{}
 }
 
 // Config holds optional server configuration.
@@ -90,23 +82,37 @@ type Config struct {
 	// PeerFinder provides the current peer set. If nil or returns an empty
 	// slice, all requests are served locally (single-node / dev mode).
 	PeerFinder PeerFinder
-	// NodeURL is this node's own base URL (e.g. "https://node-abc123.example.com").
+	// NodeURL is this node's own base URL (e.g. "http://localhost:8081").
 	// Must be set for routing to be active; leave empty to serve all requests locally.
-	NodeURL string
+	NodeURL *url.URL
+	// ClusterURL is the cluster/regional base URL (e.g. "http://localhost:8080").
+	// When set, GET requests arriving via this host are redirected to NodeURL so
+	// clients cache a stable node address for reconnection.
+	ClusterURL *url.URL
+	// ClusterSecret is the shared HMAC key for HRW scoring. All nodes in the
+	// cluster must use the same value. When empty, a zero key is used (dev only).
+	ClusterSecret string
 }
 
 type server struct {
-	hub       *hub
-	peers     PeerFinder
-	nodeURL   string
-	framePool sync.Pool
+	hub        *hub
+	peers      PeerFinder
+	nodeURL    *url.URL
+	clusterURL *url.URL
+	hashKey    [32]byte
+	framePool  sync.Pool
+	// Auth pools — eliminate per-request heap allocations on the SSE connect path.
+	authDecodePool sync.Pool // _AuthMessageSize-byte buffers for base64-decoding ?sig=
+	authMsgPool    sync.Pool // ed25519 message buffer pre-filled with sseAuthDomain
 }
 
 func NewServer(ctx context.Context, cfg Config) *server {
 	return &server{
-		hub:     newHub(ctx),
-		peers:   cfg.PeerFinder,
-		nodeURL: cfg.NodeURL,
+		hub:        newHub(ctx),
+		peers:      cfg.PeerFinder,
+		nodeURL:    cfg.NodeURL,
+		clusterURL: cfg.ClusterURL,
+		hashKey:    sha256.Sum256([]byte(cfg.ClusterSecret)),
 		framePool: sync.Pool{
 			New: func() any {
 				b := make([]byte, _FrameSize)
@@ -114,40 +120,55 @@ func NewServer(ctx context.Context, cfg Config) *server {
 				return &b
 			},
 		},
+		authDecodePool: sync.Pool{
+			New: func() any { b := make([]byte, _AuthMessageSize); return &b },
+		},
+		authMsgPool: sync.Pool{
+			New: func() any {
+				b := make([]byte, len(sseAuthDomain)+8)
+				copy(b, sseAuthDomain)
+				return &b
+			},
+		},
 	}
 }
 
-// targetPeer returns the peer URL that should handle pubkey using rendezvous
-// (HRW) hashing, or "" if this node is the target or no peers are configured.
+// targetPeer returns the parsed URL of the peer that should handle pubkey using
+// rendezvous (HRW) hashing, or nil if this node is the target or no peers are
+// configured.
 //
-// For each peer, score = fnv64a(pubkey + "\x00" + peerURL). The peer with the
-// highest score wins. This minimises churn on topology changes: adding or
-// removing a node only rerouteskeys that were assigned to that node.
-func (s *server) targetPeer(pubkeyStr string) string {
-	if s.peers == nil || s.nodeURL == "" {
-		return ""
+// For each peer, score = HMAC-SHA256(clusterSecret, pubkey || "\x00" || peerURL)[0:8]
+// interpreted as a big-endian uint64. The peer with the highest score wins.
+// Using a keyed hash prevents clients from generating pubkeys that target a
+// specific node. HRW minimises churn: only keys assigned to an added/removed
+// node are reassigned.
+func (s *server) targetPeer(pubkeyStr string) *url.URL {
+	if s.peers == nil || s.nodeURL == nil {
+		return nil
 	}
 	peers := s.peers.Peers()
 	if len(peers) == 0 {
-		return ""
+		return nil
 	}
 
-	h := fnv.New64a()
-	var best string
+	best := peers[0]
 	var bestScore uint64
+	var sum [sha256.Size]byte
+	mac := hmac.New(sha256.New, s.hashKey[:])
 	for _, peer := range peers {
-		h.Reset()
-		io.WriteString(h, pubkeyStr)
-		h.Write([]byte{0})
-		io.WriteString(h, peer)
-		if score := h.Sum64(); score > bestScore {
+		io.WriteString(mac, pubkeyStr)
+		mac.Write([]byte{0})
+		io.WriteString(mac, peer.Host)
+		mac.Sum(sum[:0])
+		mac.Reset()
+		if score := binary.BigEndian.Uint64(sum[:8]); score > bestScore {
 			bestScore = score
 			best = peer
 		}
 	}
 
-	if best == s.nodeURL {
-		return ""
+	if best.Host == s.nodeURL.Host {
+		return nil
 	}
 	return best
 }
@@ -159,7 +180,7 @@ func (s *server) targetPeer(pubkeyStr string) string {
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
 		h := w.Header()
-		h.Set("Access-Control-Allow-Origin", "*")
+		h["Access-Control-Allow-Origin"] = corsOriginAny
 		h.Set("Access-Control-Allow-Methods", "GET, POST")
 		h.Set("Access-Control-Allow-Headers", "Content-Type")
 		w.WriteHeader(http.StatusNoContent)
@@ -168,14 +189,37 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	pubKey := strings.Trim(r.URL.Path, "/")
 	if len(pubKey) != 43 {
-		http.NotFound(w, r)
+		http.Error(w, errInvalidPubKey.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// if target := s.targetPeer(pubkeyStr); target != "" {
-	// 	http.Redirect(w, r, target+r.URL.RequestURI(), http.StatusTemporaryRedirect)
-	// 	return
-	// }
+	if target := s.targetPeer(pubKey); target != nil {
+		// Another node is the HRW owner. Before redirecting, check whether the
+		// request already arrived with the target's hostname — this means the
+		// client followed a previous redirect to that node but DNS fell through
+		// to us (e.g. CNAME drain). Redirecting again would loop; return 503 so
+		// the client backs off until the routing table converges.
+		if r.Host == target.Host {
+			http.Error(w, errNodeUnavailable.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		u := *target
+		u.Path = r.URL.Path
+		u.RawQuery = r.URL.RawQuery
+		http.Redirect(w, r, u.String(), http.StatusTemporaryRedirect)
+		return
+	}
+
+	// This node is the HRW owner (or routing is disabled in single-node mode).
+	// Redirect GET requests that arrived via the cluster hostname to the stable
+	// node URL so the client caches a direct address for reconnection.
+	if r.Method == http.MethodGet && s.clusterURL != nil && r.Host == s.clusterURL.Host {
+		u := *s.nodeURL
+		u.Path = r.URL.Path
+		u.RawQuery = r.URL.RawQuery
+		http.Redirect(w, r, u.String(), http.StatusTemporaryRedirect)
+		return
+	}
 
 	switch r.Method {
 	case http.MethodGet:
@@ -229,15 +273,15 @@ func decodePubKeyInto(src, dst []byte) (ed25519.PublicKey, error) {
 //
 // rawSig is the raw base64url bytes — callers pass the query param or header
 // value directly without converting to string, avoiding an allocation.
-func verifyAuth(rawSig []byte, pubkey ed25519.PublicKey) error {
-	rawp := authDecodePool.Get().(*[]byte)
+func (s *server) verifyAuth(rawSig []byte, pubkey ed25519.PublicKey) error {
+	rawp := s.authDecodePool.Get().(*[]byte)
 	n, err := base64.RawURLEncoding.Decode(*rawp, rawSig)
 	if err != nil {
-		authDecodePool.Put(rawp)
+		s.authDecodePool.Put(rawp)
 		return errInvalidEncoding
 	}
 	if n != _AuthMessageSize {
-		authDecodePool.Put(rawp)
+		s.authDecodePool.Put(rawp)
 		return errInvalidSignatureLength
 	}
 
@@ -247,16 +291,16 @@ func verifyAuth(rawSig []byte, pubkey ed25519.PublicKey) error {
 
 	delta := time.Now().Unix() - ts
 	if delta < -60 || delta > 2 {
-		authDecodePool.Put(rawp)
+		s.authDecodePool.Put(rawp)
 		return fmt.Errorf("timestamp outside window")
 	}
 
 	// authMsgPool buffers are pre-filled with sseAuthDomain; only write tsBytes.
-	msgp := authMsgPool.Get().(*[]byte)
+	msgp := s.authMsgPool.Get().(*[]byte)
 	copy((*msgp)[len(sseAuthDomain):], tsBytes)
 	ok := ed25519.Verify(pubkey, *msgp, sig)
-	authMsgPool.Put(msgp)
-	authDecodePool.Put(rawp)
+	s.authMsgPool.Put(msgp)
+	s.authDecodePool.Put(rawp)
 
 	if !ok {
 		return fmt.Errorf("signature verification failed")
@@ -281,7 +325,7 @@ func (s *server) listenForMessages(w http.ResponseWriter, r *http.Request, pubke
 		return
 	}
 
-	if err := verifyAuth([]byte(sigStr), pubkey); err != nil {
+	if err := s.verifyAuth([]byte(sigStr), pubkey); err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}

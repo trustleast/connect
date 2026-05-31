@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -12,8 +13,8 @@ import (
 	"log"
 	"net"
 	"net/http"
-	_ "net/http/pprof"
-	"runtime"
+	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -58,28 +59,43 @@ func (l *sizingListener) Accept() (net.Conn, error) {
 	return c, nil
 }
 
-// instanceConfig is the JSON structure stored in the SSM config parameter.
+// instanceConfig is the full JSON config loaded from S3. Any non-zero field
+// overrides the corresponding CLI flag. This allows cluster-wide configuration
+// without baking secrets into the binary or launch template.
+// Node-specific values (e.g. NodeURL) are derived at runtime from the instance itself.
 type instanceConfig struct {
-	Cert string `json:"cert"` // base64-encoded TLS certificate PEM
-	Key  string `json:"key"`  // base64-encoded TLS private key PEM
-	ASG  string `json:"asg"`  // Auto Scaling Group name for peer discovery
+	Cert          string   `json:"cert"`           // base64-encoded TLS certificate PEM
+	Key           string   `json:"key"`            // base64-encoded TLS private key PEM
+	ASG           string   `json:"asg"`            // Auto Scaling Group name for EC2 peer discovery
+	Addr          string   `json:"addr"`           // listen address (overrides -addr)
+	ClusterURL    string   `json:"cluster_url"`    // cluster/regional base URL (overrides -cluster-url)
+	ZoneName      string   `json:"zone_name"`      // DNS zone for peer URL derivation (overrides -zone-name)
+	ClusterSecret string   `json:"cluster_secret"` // shared HRW hash secret (overrides -cluster-secret)
+	Peers         []string `json:"peers"`          // static peer list (overrides -peers)
 }
+
+// staticPeerFinder implements connect.PeerFinder for a fixed peer list.
+// OnChange returns a channel that is never written to because the peer set never changes.
+type staticPeerFinder struct {
+	peers    []*url.URL
+	onChange chan struct{}
+}
+
+func (f *staticPeerFinder) Peers() []*url.URL         { return f.peers }
+func (f *staticPeerFinder) OnChange() <-chan struct{} { return f.onChange }
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	network := flag.String("network", "tcp", "listen network (tcp, tcp4, tcp6)")
 	configS3 := flag.String("config-s3", "", "S3 URI for JSON instance config, e.g. s3://bucket/key (enables HTTPS + peer discovery)")
 	awsRegion := flag.String("aws-region", "", "AWS region (required when running in environments without IMDSv2, e.g. NanoVMs)")
-	nodeURL := flag.String("node-url", "", "this node's base URL for peer routing, e.g. https://node-abc123.example.com")
+	clusterURL := flag.String("cluster-url", "", "cluster/regional base URL, e.g. https://us-east.example.com")
+	clusterSecret := flag.String("cluster-secret", "", "shared HRW hash secret; all nodes in the cluster must use the same value")
+	peers := flag.String("peers", "", "comma-separated static peer base URLs, e.g. http://localhost:8081,http://localhost:8082")
 	zoneName := flag.String("zone-name", "", "DNS zone name used to derive peer node URLs from IPv6 addresses, e.g. peerwave.ai")
-	debugAddr := flag.String("debug-addr", "", "optional address for debug/runtime HTTP endpoint, e.g. 127.0.0.1:18090")
 	flag.Parse()
 
 	ctx := context.Background()
-
-	if *debugAddr != "" {
-		startDebugServer(*debugAddr)
-	}
 
 	var cfg instanceConfig
 	if *configS3 != "" {
@@ -88,27 +104,78 @@ func main() {
 		if err != nil {
 			log.Fatalf("fetching instance config: %v", err)
 		}
+		// S3 config fields override CLI flags when non-zero.
+		if cfg.Addr != "" {
+			*addr = cfg.Addr
+		}
+		if cfg.ClusterURL != "" {
+			*clusterURL = cfg.ClusterURL
+		}
+		if cfg.ZoneName != "" {
+			*zoneName = cfg.ZoneName
+		}
+		if cfg.ClusterSecret != "" {
+			*clusterSecret = cfg.ClusterSecret
+		}
+		if len(cfg.Peers) > 0 {
+			*peers = strings.Join(cfg.Peers, ",")
+		}
 	}
 
 	var peerFinder connect.PeerFinder
-	if cfg.ASG != "" && *zoneName != "" {
+	switch {
+	case cfg.ASG != "" && *zoneName != "":
 		awsCfg, err := config.LoadDefaultConfig(ctx, awsConfigOpts(*awsRegion)...)
 		if err != nil {
 			log.Fatalf("loading AWS config for peer finder: %v", err)
 		}
-		pf := &ec2PeerFinder{
-			ec2:      ec2svc.NewFromConfig(awsCfg),
-			asgName:  cfg.ASG,
-			zoneName: *zoneName,
-			scheme:   "https",
-		}
+		pf := newEC2PeerFinder(ec2svc.NewFromConfig(awsCfg), cfg.ASG, *zoneName, "https")
 		pf.start(ctx)
 		peerFinder = pf
+	case *peers != "":
+		parts := strings.Split(*peers, ",")
+		peerURLs := make([]*url.URL, 0, len(parts))
+		for _, p := range parts {
+			u, err := url.Parse(strings.TrimSpace(p))
+			if err != nil {
+				log.Fatalf("invalid peer URL %q: %v", p, err)
+			}
+			peerURLs = append(peerURLs, u)
+		}
+		peerFinder = &staticPeerFinder{peers: peerURLs, onChange: make(chan struct{})}
+	}
+
+	if peerFinder != nil && *clusterSecret == "" {
+		log.Println("warning: -cluster-secret not set; HRW routing uses a zero key (dev mode only)")
+	}
+
+	// Determine scheme from TLS config: HTTPS when cert is present, HTTP otherwise.
+	scheme := "http"
+	if cfg.Cert != "" {
+		scheme = "https"
 	}
 
 	connectCfg := connect.Config{
-		PeerFinder: peerFinder,
-		NodeURL:    *nodeURL,
+		PeerFinder:    peerFinder,
+		ClusterSecret: *clusterSecret,
+	}
+	if *zoneName != "" {
+		u, err := selfNodeURL(*zoneName, scheme)
+		if err != nil {
+			log.Fatalf("detecting node URL: %v", err)
+		}
+		if u == nil {
+			log.Fatalf("no public IPv6 address found on any interface; cannot derive node URL for zone %q", *zoneName)
+		}
+		connectCfg.NodeURL = u
+		log.Printf("node URL: %s", u)
+	}
+	if *clusterURL != "" {
+		u, err := url.Parse(*clusterURL)
+		if err != nil {
+			log.Fatalf("invalid -cluster-url %q: %v", *clusterURL, err)
+		}
+		connectCfg.ClusterURL = u
 	}
 
 	lc := net.ListenConfig{
@@ -118,13 +185,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen %s %s: %v", *network, *addr, err)
 	}
-	// Wrap the listener to set tight socket buffers on every accepted connection
-	// before the HTTP handshake begins. We know the traffic shape precisely:
-	//   rcvbuf=_AcceptRcvBuf: large enough for request headers + a max-size body
-	//                         (SDP ~1.5 KB base64, ICE ~300 B, hard cap 4 KB).
-	//   sndbuf=_AcceptSndBuf: large enough for any POST response (~300 B) and
-	//                         the SSE upgrade response (~100 B). SSE connections
-	//                         have their sndbuf raised to _FrameSize after hijack.
+
 	ln := &sizingListener{Listener: rawLn}
 	log.Println("Listening on: ", ln.Addr())
 
@@ -232,18 +293,35 @@ func buildTLS(certB64, keyB64 string) (*tls.Config, error) {
 // and exposes their node URLs for pubkey-based routing.
 type ec2PeerFinder struct {
 	mu       sync.RWMutex
-	peers    []string
+	peers    []*url.URL
+	onChange chan struct{}
 	ec2      *ec2svc.Client
 	asgName  string
 	zoneName string
 	scheme   string
 }
 
-func (f *ec2PeerFinder) Peers() []string {
+func newEC2PeerFinder(client *ec2svc.Client, asgName, zoneName, scheme string) *ec2PeerFinder {
+	return &ec2PeerFinder{
+		onChange: make(chan struct{}, 1),
+		ec2:      client,
+		asgName:  asgName,
+		zoneName: zoneName,
+		scheme:   scheme,
+	}
+}
+
+func (f *ec2PeerFinder) Peers() []*url.URL {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.peers
 }
+
+// OnChange returns a channel that receives an empty signal whenever the set of
+// running ASG instances changes. The channel has a buffer of 1; if the consumer
+// is slow, intermediate signals are dropped (the consumer calls Peers() for the
+// authoritative current list).
+func (f *ec2PeerFinder) OnChange() <-chan struct{} { return f.onChange }
 
 func (f *ec2PeerFinder) refresh(ctx context.Context) {
 	out, err := f.ec2.DescribeInstances(ctx, &ec2svc.DescribeInstancesInput{
@@ -257,23 +335,35 @@ func (f *ec2PeerFinder) refresh(ctx context.Context) {
 		return
 	}
 
-	var peers []string
+	var peers []*url.URL
 	for _, r := range out.Reservations {
 		for _, inst := range r.Instances {
-			for _, iface := range inst.NetworkInterfaces {
-				for _, addr := range iface.Ipv6Addresses {
-					if addr.Ipv6Address != nil {
-						peers = append(peers, ipNodeURL(aws.ToString(addr.Ipv6Address), f.zoneName, f.scheme))
-					}
-				}
+			u, err := instanceURL(inst, f.zoneName, f.scheme)
+			if err != nil {
+				log.Printf("peer refresh: instance %s: %v", aws.ToString(inst.InstanceId), err)
+				continue
+			}
+			if u != nil {
+				peers = append(peers, u)
 			}
 		}
 	}
+	slices.SortFunc(peers, func(a, b *url.URL) int { return strings.Compare(a.Host, b.Host) })
 
 	f.mu.Lock()
+	changed := !slices.EqualFunc(f.peers, peers, func(a, b *url.URL) bool { return a.Host == b.Host })
 	f.peers = peers
 	f.mu.Unlock()
+
 	log.Printf("peers refreshed: %v", peers)
+	if changed {
+		// Non-blocking send: if the buffer is full the consumer hasn't processed
+		// the last notification yet; it will call Peers() when it does.
+		select {
+		case f.onChange <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (f *ec2PeerFinder) start(ctx context.Context) {
@@ -290,44 +380,77 @@ func (f *ec2PeerFinder) start(ctx context.Context) {
 	}()
 }
 
+// instanceURL returns the peer URL for the first public IPv6 address found on
+// the instance's network interfaces, ordered by device index so the primary ENI
+// (index 0) is preferred. Returns nil, nil if the instance has no usable address.
+func instanceURL(inst types.Instance, zoneName, scheme string) (*url.URL, error) {
+	ifaces := make([]types.InstanceNetworkInterface, len(inst.NetworkInterfaces))
+	copy(ifaces, inst.NetworkInterfaces)
+	slices.SortFunc(ifaces, func(a, b types.InstanceNetworkInterface) int {
+		ai, bi := int32(0), int32(0)
+		if a.Attachment != nil && a.Attachment.DeviceIndex != nil {
+			ai = *a.Attachment.DeviceIndex
+		}
+		if b.Attachment != nil && b.Attachment.DeviceIndex != nil {
+			bi = *b.Attachment.DeviceIndex
+		}
+		return cmp.Compare(ai, bi)
+	})
+	for _, iface := range ifaces {
+		for _, addr := range iface.Ipv6Addresses {
+			if addr.Ipv6Address == nil {
+				continue
+			}
+			ip := net.ParseIP(aws.ToString(addr.Ipv6Address))
+			if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+				continue
+			}
+			return ipNodeURL(aws.ToString(addr.Ipv6Address), zoneName, scheme)
+		}
+	}
+	return nil, nil
+}
+
 // ipNodeURL derives a stable node base URL from an IPv6 address.
 // The first 4 bytes of SHA-256(canonical IP) become an 8-char hex prefix,
 // matching the hash used by the Cloudflare registration Lambda.
-func ipNodeURL(ip, zoneName, scheme string) string {
+func ipNodeURL(ip, zoneName, scheme string) (*url.URL, error) {
 	canonical := net.ParseIP(ip).String()
 	h := sha256.Sum256([]byte(canonical))
-	return fmt.Sprintf("%s://node-%s.%s", scheme, hex.EncodeToString(h[:4]), zoneName)
+	return url.Parse(fmt.Sprintf("%s://node-%s.%s", scheme, hex.EncodeToString(h[:4]), zoneName))
 }
 
-// startDebugServer binds a local-only HTTP server that exposes Go runtime
-// memory stats as JSON for sse-memprobe's -server-debug-url flag.
-// Listens on addr (e.g. "127.0.0.1:18090") and never serves externally.
-func startDebugServer(addr string) {
-	mux := http.NewServeMux()
-	mux.Handle("/debug/pprof/", http.DefaultServeMux) // registered by net/http/pprof init
-	mux.HandleFunc("/debug/runtime", func(w http.ResponseWriter, r *http.Request) {
-		var m runtime.MemStats
-		runtime.ReadMemStats(&m)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(struct {
-			Goroutines int    `json:"goroutines"`
-			HeapAlloc  uint64 `json:"heap_alloc"`
-			HeapSys    uint64 `json:"heap_sys"`
-			StackInuse uint64 `json:"stack_inuse"`
-			Sys        uint64 `json:"sys"`
-		}{
-			Goroutines: runtime.NumGoroutine(),
-			HeapAlloc:  m.HeapAlloc,
-			HeapSys:    m.HeapSys,
-			StackInuse: m.StackInuse,
-			Sys:        m.Sys,
-		})
-	})
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("debug server: %v", err)
+// selfNodeURL finds this node's base URL by scanning local network interfaces
+// for a public IPv6 address and deriving the URL via ipNodeURL. Interfaces are
+// iterated in system order; the first usable address wins. Returns nil, nil if
+// no suitable address is found.
+func selfNodeURL(zoneName, scheme string) (*url.URL, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("listing interfaces: %w", err)
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
 		}
-	}()
-	log.Printf("debug server listening on %s", addr)
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			// IPv6 only: To4() returns non-nil for IPv4 and IPv4-mapped addresses.
+			if ip == nil || ip.To4() != nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+				continue
+			}
+			return ipNodeURL(ip.String(), zoneName, scheme)
+		}
+	}
+	return nil, nil
 }
