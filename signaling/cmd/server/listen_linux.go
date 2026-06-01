@@ -1,9 +1,13 @@
+//go:build linux
+
 package main
 
-import (
-	"syscall"
+import "syscall"
 
-	"golang.org/x/sys/unix"
+// Linux socket constants not exported by the syscall package.
+const (
+	_SO_REUSEPORT = 0xf // linux/socket.h
+	_TCP_FASTOPEN = 23  // linux/tcp.h
 )
 
 // listenControl sets socket options on the listener fd before bind.
@@ -19,17 +23,17 @@ import (
 func listenControl(network, address string, c syscall.RawConn) error {
 	var setSockErr error
 	err := c.Control(func(fd uintptr) {
-		if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+		if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, _SO_REUSEPORT, 1); err != nil {
 			setSockErr = err
 			return
 		}
-		if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+		if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
 			setSockErr = err
 			return
 		}
 		// TFO queue depth of 16 is conservative; tune up if benchmarks show
 		// connection-setup latency under burst load.
-		unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_FASTOPEN, 16) //nolint:errcheck
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, _TCP_FASTOPEN, 16) //nolint:errcheck
 	})
 	if err != nil {
 		return err

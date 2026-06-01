@@ -106,7 +106,22 @@ type server struct {
 	authMsgPool    sync.Pool // ed25519 message buffer pre-filled with sseAuthDomain
 }
 
-func NewServer(ctx context.Context, cfg Config) *server {
+func NewHTTPServer(ctx context.Context, cfg Config) *http.Server {
+	server := newServer(ctx, cfg)
+	return &http.Server{
+		Handler: server,
+		// Disable HTTP/2: ServeTLS enables it automatically via ALPN, but
+		// hijacking (required for SSE) is not available on HTTP/2 streams.
+		TLSNextProto:      make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      0,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 10, // 1 KiB
+	}
+}
+
+func newServer(ctx context.Context, cfg Config) *server {
 	return &server{
 		hub:        newHub(ctx),
 		peers:      cfg.PeerFinder,
@@ -131,6 +146,7 @@ func NewServer(ctx context.Context, cfg Config) *server {
 			},
 		},
 	}
+
 }
 
 // targetPeer returns the parsed URL of the peer that should handle pubkey using

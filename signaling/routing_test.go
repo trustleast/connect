@@ -23,7 +23,7 @@ func newRoutingPeerFinder(peers ...*url.URL) *routingPeerFinder {
 	return &routingPeerFinder{peers: peers, onChange: make(chan struct{})}
 }
 
-func (f *routingPeerFinder) Peers() []*url.URL        { return f.peers }
+func (f *routingPeerFinder) Peers() []*url.URL         { return f.peers }
 func (f *routingPeerFinder) OnChange() <-chan struct{} { return f.onChange }
 
 // hrwTarget replicates targetPeer's scoring. Must stay in sync with server.targetPeer.
@@ -83,7 +83,7 @@ func mustParseURL(t *testing.T, raw string) *url.URL {
 // TestSingleNode verifies that a server with no PeerFinder serves all requests
 // locally without redirecting.
 func TestSingleNode(t *testing.T) {
-	srv := httptest.NewServer(NewServer(t.Context(), Config{}))
+	srv := httptest.NewServer(newServer(t.Context(), Config{}))
 	defer srv.Close()
 
 	pub, _, _ := ed25519.GenerateKey(nil)
@@ -123,7 +123,7 @@ func TestSinglePeerIsSelf(t *testing.T) {
 		NodeURL:       nodeA,
 		ClusterSecret: routingSecret,
 	}
-	srv := httptest.NewServer(NewServer(t.Context(), cfg))
+	srv := httptest.NewServer(newServer(t.Context(), cfg))
 	defer srv.Close()
 
 	pub, _, _ := ed25519.GenerateKey(nil)
@@ -148,7 +148,7 @@ func TestTwoNodeRouting(t *testing.T) {
 		NodeURL:       nodeA,
 		ClusterSecret: routingSecret,
 	}
-	srv := httptest.NewServer(NewServer(t.Context(), cfg))
+	srv := httptest.NewServer(newServer(t.Context(), cfg))
 	defer srv.Close()
 
 	selfKey := pubkeyOwnedBy(t, routingSecret, peers, nodeA.Host)
@@ -227,7 +227,7 @@ func TestLoopDetection(t *testing.T) {
 		NodeURL:       nodeA,
 		ClusterSecret: routingSecret,
 	}
-	srv := httptest.NewServer(NewServer(t.Context(), cfg))
+	srv := httptest.NewServer(newServer(t.Context(), cfg))
 	defer srv.Close()
 
 	// Use a key owned by nodeB so that nodeA would normally redirect there.
@@ -263,7 +263,7 @@ func TestClusterRedirect(t *testing.T) {
 		ClusterURL:    cluster,
 		ClusterSecret: routingSecret,
 	}
-	srv := httptest.NewServer(NewServer(t.Context(), cfg))
+	srv := httptest.NewServer(newServer(t.Context(), cfg))
 	defer srv.Close()
 
 	selfKey := pubkeyOwnedBy(t, routingSecret, peers, nodeA.Host)
