@@ -5,17 +5,7 @@ output "config_s3_uri" {
 
 output "config_bucket" {
   value       = aws_s3_bucket.config.bucket
-  description = "S3 bucket name for instance config"
-}
-
-output "ami_id" {
-  value       = module.ami.ami_id
-  description = "AMI ID used by instances in this region"
-}
-
-output "ops_bucket" {
-  value       = module.ami.ops_bucket
-  description = "S3 bucket name used by ops CLI to stage disk images during AMI creation"
+  description = "S3 bucket name for instance config (also stores the binary at connect-arm64)"
 }
 
 output "security_group_id" {

@@ -34,3 +34,8 @@ variable "domain" {
   type        = string
   description = "Base domain for signaling (e.g. connect.example.com). Node records are created as node-{hash}.{zone}."
 }
+
+variable "ssh_pub_key" {
+  type        = string
+  description = "SSH public key added to ec2-user's authorized_keys on each instance."
+}

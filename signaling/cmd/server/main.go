@@ -302,7 +302,7 @@ func (f *ec2PeerFinder) refresh(ctx context.Context) {
 		},
 	})
 	if err != nil {
-		log.Printf("peer refresh: describe instances: %v", err)
+		log.Printf("peer refresh: 2describe instances: %v", err)
 		return
 	}
 

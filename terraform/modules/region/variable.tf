@@ -24,3 +24,8 @@ variable "cloudflare_api_token" {
 variable "domain" {
   type = string
 }
+
+variable "ssh_pub_key" {
+  type        = string
+  description = "SSH public key added to ec2-user's authorized_keys on each instance."
+}

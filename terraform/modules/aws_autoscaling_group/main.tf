@@ -99,6 +99,7 @@ resource "aws_launch_template" "this" {
 
   image_id      = var.ami_id
   instance_type = var.instance_type
+  user_data     = var.user_data
 
   credit_specification {
     cpu_credits = "standard"

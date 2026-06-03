@@ -53,5 +53,11 @@ variable "instance_type" {
 
 variable "ami_id" {
   type        = string
-  description = "AMI ID for the NanoVMs connect image in this region"
+  description = "AMI ID for EC2 instances in this region"
+}
+
+variable "user_data" {
+  type        = string
+  description = "Base64-encoded user data script run on first boot (installs systemd unit)"
+  nullable    = false
 }

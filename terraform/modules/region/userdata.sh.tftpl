@@ -1,0 +1,52 @@
+#!/bin/bash
+set -euo pipefail
+
+# binary-version: ${source_hash}
+# Included so that a new binary upload produces a new launch template version,
+# triggering ASG instance refresh without any manual intervention.
+
+# Configure AWS CLI to use the dual-stack S3 endpoint.
+# Instances are IPv6-only (no IPv4 public address), so the default
+# IPv4-only S3 endpoint is unreachable.
+mkdir -p /root/.aws
+cat > /root/.aws/config <<'EOF'
+[default]
+s3 =
+    use_dualstack_endpoint = true
+EOF
+
+# Pull the latest binary from S3 before each start.
+cat > /usr/local/bin/connect-update <<'EOF'
+#!/bin/bash
+set -e
+aws s3 cp ${binary_s3_uri} /usr/local/bin/connect
+chmod +x /usr/local/bin/connect
+EOF
+chmod +x /usr/local/bin/connect-update
+
+cat > /etc/systemd/system/connect.service <<'EOF'
+[Unit]
+Description=Connect Signaling Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStartPre=/usr/local/bin/connect-update
+ExecStart=/usr/local/bin/connect ${args}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+mkdir -p /home/ec2-user/.ssh
+cat <<EOT >> /home/ec2-user/.ssh/authorized_keys
+${ssh_pub_key}
+EOT
+chmod 600 /home/ec2-user/.ssh/authorized_keys
+chown -R ec2-user:ec2-user /home/ec2-user/.ssh
+
+systemctl daemon-reload
+systemctl enable connect
+systemctl start connect
