@@ -67,6 +67,20 @@ resource "aws_security_group" "instance" {
     cidr_blocks      = data.cloudflare_ip_ranges.ip_ranges.ipv4_cidr_blocks
   }
 
+  ingress {
+    from_port        = 22
+    to_port          = 22
+    protocol         = "tcp"
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
+  ingress {
+    from_port        = 8080
+    to_port          = 8080
+    protocol         = "tcp"
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
   # Outbound HTTPS for SSM, EC2 APIs, and NTP (all over IPv6).
   egress {
     from_port        = 443

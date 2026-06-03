@@ -46,10 +46,11 @@ resource "local_file" "ops_json" {
     RunConfig = {
       Ports = ["443"]
     }
+    # RebootOnExit = true
     ManifestPassthrough = {
       exec_wait_for_ip6_secs = "5"
-      so_rcvbuf              = "8192"
-      so_sndbuf              = "8192"
+      # so_rcvbuf = "4096"
+      # so_sndbuf = "4096"
     }
     CloudConfig = {
       Platform   = "aws"
@@ -69,7 +70,7 @@ resource "terraform_data" "build_binary" {
   }
 
   provisioner "local-exec" {
-    command     = "go build -trimpath -o 'terraform/${path.module}/${local.binary_name}' ./cmd/server/"
+    command     = "go build -trimpath -o '../terraform/${path.module}/${local.binary_name}' ./cmd/server/"
     working_dir = local.repo_root
     environment = {
       CGO_ENABLED = "0"
@@ -91,7 +92,7 @@ resource "terraform_data" "publish_ami" {
   ]
 
   provisioner "local-exec" {
-    command     = "ops image create '${local.binary_name}' --arch arm64 -c '${local.config_name}' -t aws -i '${local.image_name}' && echo 'Finished!'"
+    command     = "ops image create '${local.binary_name}' -c '${local.config_name}' -t aws -i '${local.image_name}' && echo 'Finished!'"
     working_dir = abspath(path.module)
     environment = {
       AWS_DEFAULT_REGION = data.aws_region.current.region

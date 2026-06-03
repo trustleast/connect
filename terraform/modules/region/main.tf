@@ -42,7 +42,6 @@ module "ami" {
   args = [
     "-addr", "[::]:443",
     "-network", "tcp6",
-    "-aws-region", local.region,
     "-config-s3", "s3://${aws_s3_bucket.config.bucket}/config.json",
     "-zone-name", local.zone_name,
   ]
@@ -68,6 +67,11 @@ module "asg" {
       Resource = ["${aws_s3_bucket.config.arn}/config.json"]
       Effect   = "Allow"
     },
+    {
+      Action   = ["ec2:DescribeInstances"]
+      Resource = ["*"]
+      Effect   = "Allow"
+    }
   ]
 }
 

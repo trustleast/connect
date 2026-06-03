@@ -18,8 +18,11 @@ import (
 	"sync"
 	"time"
 
+	"os"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	ec2svc "github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -40,7 +43,7 @@ type serverConfig struct {
 	ClusterSecret string
 	Peers         []string
 	Network       string
-	AWSRegion     string
+	AWSRegion     string // detected at startup from env or IMDS; not a flag
 }
 
 // staticPeerFinder implements connect.PeerFinder for a fixed peer list.
@@ -53,11 +56,12 @@ type staticPeerFinder struct {
 func (f *staticPeerFinder) Peers() []*url.URL         { return f.peers }
 func (f *staticPeerFinder) OnChange() <-chan struct{} { return f.onChange }
 
-func getConfig(ctx context.Context) serverConfig {
+func getConfig(ctx context.Context) (serverConfig, error) {
 	// 1. Sensible defaults.
 	cfg := serverConfig{
-		Addr:    ":8080",
-		Network: "tcp",
+		Addr:      ":8080",
+		Network:   "tcp",
+		AWSRegion: "us-east-1",
 	}
 
 	// Define flags. Defaults match cfg above so the usage text is accurate, but
@@ -66,24 +70,31 @@ func getConfig(ctx context.Context) serverConfig {
 	addr := flag.String("addr", cfg.Addr, "listen address")
 	network := flag.String("network", cfg.Network, "listen network (tcp, tcp4, tcp6)")
 	configS3 := flag.String("config-s3", "", "S3 URI for JSON instance config, e.g. s3://bucket/key")
-	awsRegion := flag.String("aws-region", "", "AWS region (required without IMDSv2, e.g. NanoVMs)")
 	clusterURL := flag.String("cluster-url", "", "cluster/regional base URL, e.g. https://us-east.example.com")
 	clusterSecret := flag.String("cluster-secret", "", "shared HRW hash secret; all nodes must use the same value")
 	peers := flag.String("peers", "", "comma-separated static peer base URLs, e.g. http://localhost:8081,http://localhost:8082")
 	zoneName := flag.String("zone-name", "", "DNS zone for peer URL derivation, e.g. example.com")
 	flag.Parse()
 
+	log.Println("Preparing to detect region")
+	os.Stdout.Sync()
+	region, err := detectRegion(ctx)
+	if err != nil {
+		return serverConfig{}, err
+	}
+
+	cfg.AWSRegion = region
+
 	// 2. Apply S3 config over defaults. json.Decode only sets fields present in
 	// the JSON, so absent keys leave the defaults in cfg untouched.
 	if *configS3 != "" {
-		if err := getS3Config(ctx, *configS3, *awsRegion, &cfg); err != nil {
-			log.Fatalf("fetching instance config: %v", err)
+		if err := getS3Config(ctx, *configS3, cfg.AWSRegion, &cfg); err != nil {
+			return serverConfig{}, fmt.Errorf("loading config from S3: %w", err)
 		}
 	}
 
 	// 3. Explicit CLI flags override S3. flag.Visit only visits flags that were
 	// actually set on the command line, leaving S3 values intact for the rest.
-	cfg.AWSRegion = *awsRegion // CLI-only; always apply
 	flag.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "addr":
@@ -101,63 +112,75 @@ func getConfig(ctx context.Context) serverConfig {
 		}
 	})
 
-	return cfg
-}
-
-// sizingListener wraps a net.Listener and sets tight socket buffers on every
-// accepted TCP connection before the HTTP layer sees it.
-type sizingListener struct {
-	net.Listener
-	rcvbuf, sndbuf int
-}
-
-func (l *sizingListener) Accept() (net.Conn, error) {
-	c, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-	if tc, ok := c.(*net.TCPConn); ok {
-		tc.SetReadBuffer(l.rcvbuf)  //nolint:errcheck
-		tc.SetWriteBuffer(l.sndbuf) //nolint:errcheck
-	}
-	return c, nil
+	return cfg, nil
 }
 
 func main() {
 	ctx := context.Background()
-	cfg := getConfig(ctx)
+
+	if err := run(ctx); err != nil {
+		for {
+			log.Println("fatal:", err)
+			time.Sleep(5 * time.Second)
+		}
+	}
+}
+
+func run(ctx context.Context) error {
+	cfg, err := getConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("getting config: %w", err)
+	}
 
 	var peerFinder connect.PeerFinder
-	switch {
-	case cfg.ASG != "" && cfg.ZoneName != "":
-		awsCfg, err := config.LoadDefaultConfig(ctx, awsConfigOpts(cfg.AWSRegion)...)
-		if err != nil {
-			log.Fatalf("loading AWS config for peer finder: %v", err)
-		}
-		pf := newEC2PeerFinder(ec2svc.NewFromConfig(awsCfg), cfg.ASG, cfg.ZoneName, "https")
-		pf.start(ctx)
-		peerFinder = pf
-	case len(cfg.Peers) > 0:
-		peerURLs := make([]*url.URL, 0, len(cfg.Peers))
-		for _, p := range cfg.Peers {
-			u, err := url.Parse(strings.TrimSpace(p))
-			if err != nil {
-				log.Fatalf("invalid peer URL %q: %v", p, err)
-			}
-			peerURLs = append(peerURLs, u)
-		}
-		peerFinder = &staticPeerFinder{peers: peerURLs, onChange: make(chan struct{})}
-	}
+	// switch {
+	// case cfg.ASG != "" && cfg.ZoneName != "":
+	// 	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(cfg.AWSRegion))
+	// 	if err != nil {
+	// 		return fmt.Errorf("loading AWS config for peer finder: %w", err)
+	// 	}
+	// 	pf := newEC2PeerFinder(ec2svc.NewFromConfig(awsCfg), cfg.ASG, cfg.ZoneName, "https")
+	// 	pf.start(ctx)
+	// 	peerFinder = pf
+	// case len(cfg.Peers) > 0:
+	// 	peerURLs := make([]*url.URL, 0, len(cfg.Peers))
+	// 	for _, p := range cfg.Peers {
+	// 		u, err := url.Parse(strings.TrimSpace(p))
+	// 		if err != nil {
+	// 			return fmt.Errorf("invalid peer URL %q: %w", p, err)
+	// 		}
+	// 		peerURLs = append(peerURLs, u)
+	// 	}
+	// 	peerFinder = &staticPeerFinder{peers: peerURLs, onChange: make(chan struct{})}
+	// }
 
 	if peerFinder != nil && cfg.ClusterSecret == "" {
 		log.Println("warning: -cluster-secret not set; HRW routing uses a zero key (dev mode only)")
 	}
 
-	// Determine scheme from TLS config: HTTPS when cert is present, HTTP otherwise.
+	lc := net.ListenConfig{}
+	ln, err := lc.Listen(ctx, cfg.Network, cfg.Addr)
+	if err != nil {
+		return fmt.Errorf("listen %s %s: %w", cfg.Network, cfg.Addr, err)
+	}
+
 	scheme := "http"
 	if cfg.Cert != "" {
 		scheme = "https"
+		tlsCfg, err := buildTLS(cfg.Cert, cfg.Key)
+		if err != nil {
+			return fmt.Errorf("building TLS config: %w", err)
+		}
+		ln = tls.NewListener(ln, tlsCfg)
+
 	}
+
+	go func() {
+		for {
+			log.Printf("Listening on: %s %s", scheme, ln.Addr())
+			time.Sleep(5 * time.Second)
+		}
+	}()
 
 	connectCfg := connect.Config{
 		PeerFinder:    peerFinder,
@@ -166,10 +189,10 @@ func main() {
 	if cfg.ZoneName != "" {
 		u, err := selfNodeURL(cfg.ZoneName, scheme)
 		if err != nil {
-			log.Fatalf("detecting node URL: %v", err)
+			return fmt.Errorf("detecting node URL: %w", err)
 		}
 		if u == nil {
-			log.Fatalf("no public IPv6 address found on any interface; cannot derive node URL for zone %q", cfg.ZoneName)
+			return fmt.Errorf("no public IPv6 address found on any interface; cannot derive node URL for zone %q", cfg.ZoneName)
 		}
 		connectCfg.NodeURL = u
 		log.Printf("node URL: %s", u)
@@ -177,43 +200,17 @@ func main() {
 	if cfg.ClusterURL != "" {
 		u, err := url.Parse(cfg.ClusterURL)
 		if err != nil {
-			log.Fatalf("invalid -cluster-url %q: %v", cfg.ClusterURL, err)
+			return fmt.Errorf("invalid -cluster-url %q: %w", cfg.ClusterURL, err)
 		}
 		connectCfg.ClusterURL = u
 	}
 
-	lc := net.ListenConfig{Control: listenControl}
-	rawLn, err := lc.Listen(ctx, cfg.Network, cfg.Addr)
-	if err != nil {
-		log.Fatalf("listen %s %s: %v", cfg.Network, cfg.Addr, err)
-	}
-	var ln net.Listener = &sizingListener{Listener: rawLn, rcvbuf: 4 << 10, sndbuf: 2 << 10}
-	log.Println("Listening on:", ln.Addr())
-
 	srv := connect.NewHTTPServer(ctx, connectCfg)
-	if cfg.Cert != "" {
-		tlsCfg, err := buildTLS(cfg.Cert, cfg.Key)
-		if err != nil {
-			log.Fatalf("building TLS config: %v", err)
-		}
-		ln = tls.NewListener(ln, tlsCfg)
-	}
-	if err := srv.Serve(ln); err != nil {
-		log.Fatalf("serving: %v\n", err)
-	}
-	log.Println("server stopped")
-}
-
-// awsConfigOpts returns LoadOptions for the given region (empty = auto-detect).
-func awsConfigOpts(region string) []func(*config.LoadOptions) error {
-	if region == "" {
-		return nil
-	}
-	return []func(*config.LoadOptions) error{config.WithRegion(region)}
+	return srv.Serve(ln)
 }
 
 func getS3Config(ctx context.Context, uri, region string, cfg *serverConfig) error {
-	awsCfg, err := config.LoadDefaultConfig(ctx, awsConfigOpts(region)...)
+	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
 		return err
 	}
@@ -432,4 +429,26 @@ func selfNodeURL(zoneName, scheme string) (*url.URL, error) {
 		}
 	}
 	return nil, nil
+}
+
+// detectRegion returns the AWS region for this instance. It checks the
+// AWS_REGION and AWS_DEFAULT_REGION environment variables first, then falls
+// back to querying IMDS. Returns an empty string if neither is available
+// (e.g. local dev without AWS credentials).
+func detectRegion(ctx context.Context) (string, error) {
+	for _, env := range []string{"AWS_REGION", "AWS_DEFAULT_REGION"} {
+		if r := os.Getenv(env); r != "" {
+			return r, nil
+		}
+	}
+	out, err := imds.New(imds.Options{}).GetRegion(ctx, &imds.GetRegionInput{})
+	if err != nil {
+		return "", fmt.Errorf("querying IMDS for region: %w", err)
+	}
+
+	if out == nil {
+		return "", fmt.Errorf("no region found")
+	}
+
+	return out.Region, nil
 }

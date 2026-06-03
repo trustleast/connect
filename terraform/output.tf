@@ -17,7 +17,6 @@ output "ops_json" {
       Args = [
         "-addr", "[::]:443",
         "-network", "tcp6",
-        "-aws-region", r,
         "-config-s3", m.config_s3_uri,
         "-zone-name", m.zone_name,
         # -node-url intentionally omitted: single ad-hoc instance doesn't need
