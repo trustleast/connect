@@ -56,7 +56,7 @@ export class DialError extends Error {
 
 export type DialSetup = (pc: RTCPeerConnection) => void | Promise<void>;
 
-/** Options for a single dial attempt. Mirrors the fetch init pattern. */
+/** Options for a single dial attempt. */
 export interface DialInit {
   /** Abort the dial. Use AbortSignal.timeout(ms) for timeouts. */
   signal?: AbortSignal;
@@ -149,7 +149,9 @@ export class ConnectClient {
   private readonly options: {
     serverUrl: string;
     rtcConfiguration: RTCConfiguration;
-    acceptConnection?: (remotePublicKey: CryptoKey) => boolean | Promise<boolean>;
+    acceptConnection?: (
+      remotePublicKey: CryptoKey,
+    ) => boolean | Promise<boolean>;
     onIncoming?: (pc: RTCPeerConnection, remotePublicKey: CryptoKey) => void;
   };
   // Composite key "pubkey:challengeB64" → Session. Including the challenge
@@ -229,7 +231,9 @@ export class ConnectClient {
     const releaseIce = this.wireIce(pc, remotePubkey, challenge);
 
     const onAbort = () =>
-      settle.reject(new DialError("signaling-failed", "dial aborted", signal?.reason));
+      settle.reject(
+        new DialError("signaling-failed", "dial aborted", signal?.reason),
+      );
     signal?.addEventListener("abort", onAbort, { once: true });
 
     try {

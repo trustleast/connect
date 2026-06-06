@@ -64,6 +64,7 @@ type SignalDirection string
 const (
 	SignalInboundSSE   SignalDirection = "inbound-sse"
 	SignalOutboundPOST SignalDirection = "outbound-post"
+	_DefaultServerURL                  = "https://connect.peerwave.ai"
 )
 
 // SignalEvent is a passive observation of one wire payload.
@@ -119,6 +120,9 @@ func New(opts Options) (*Client, error) {
 	}
 	if len(opts.Configuration.ICEServers) == 0 {
 		opts.Configuration = defaultConfiguration
+	}
+	if opts.ServerURL == "" {
+		opts.ServerURL = _DefaultServerURL
 	}
 	opts.ServerURL = strings.TrimRight(opts.ServerURL, "/")
 
