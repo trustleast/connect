@@ -58,6 +58,50 @@ type Options struct {
 	OnSignal func(SignalEvent)
 }
 
+// Option is a functional option for configuring a Client.
+type Option func(*Options)
+
+// WithServerURL sets the relay server URL.
+func WithServerURL(url string) Option {
+	return func(o *Options) { o.ServerURL = url }
+}
+
+// WithConfiguration sets the WebRTC configuration (ICE servers, etc.).
+func WithConfiguration(cfg webrtc.Configuration) Option {
+	return func(o *Options) { o.Configuration = cfg }
+}
+
+// WithSettingEngine sets the pion SettingEngine for advanced WebRTC tuning.
+func WithSettingEngine(se *webrtc.SettingEngine) Option {
+	return func(o *Options) { o.SettingEngine = se }
+}
+
+// WithPrivateKey sets the ed25519 private key used for signing. If not set, a
+// key is generated automatically.
+func WithPrivateKey(key ed25519.PrivateKey) Option {
+	return func(o *Options) { o.PrivateKey = key }
+}
+
+// WithAcceptConnection sets the callback that decides whether to accept an
+// incoming offer. Return false to silently drop the offer. If not set, all
+// offers are denied.
+func WithAcceptConnection(fn func(remotePubkey string) bool) Option {
+	return func(o *Options) { o.AcceptConnection = fn }
+}
+
+// WithOnIncoming sets the callback invoked when an incoming offer has been
+// verified and accepted, before the answer is sent.
+func WithOnIncoming(fn func(pc *webrtc.PeerConnection, remotePubkey string)) Option {
+	return func(o *Options) { o.OnIncoming = fn }
+}
+
+// WithOnSignal sets a callback that observes every raw signaling payload sent
+// or received. It is informational only; the callback cannot mutate or drop
+// messages.
+func WithOnSignal(fn func(SignalEvent)) Option {
+	return func(o *Options) { o.OnSignal = fn }
+}
+
 // SignalDirection identifies where a signaling payload was observed.
 type SignalDirection string
 
@@ -110,28 +154,29 @@ type Client struct {
 }
 
 // New creates a Client. Call Listen to start receiving incoming connections.
-func New(opts Options) (*Client, error) {
-	if opts.PrivateKey == nil {
+func New(opts ...Option) (*Client, error) {
+	o := Options{
+		ServerURL:     _DefaultServerURL,
+		Configuration: defaultConfiguration,
+	}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if o.PrivateKey == nil {
 		_, privKey, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {
 			return nil, fmt.Errorf("generating key pair: %w", err)
 		}
-		opts.PrivateKey = privKey
+		o.PrivateKey = privKey
 	}
-	if len(opts.Configuration.ICEServers) == 0 {
-		opts.Configuration = defaultConfiguration
-	}
-	if opts.ServerURL == "" {
-		opts.ServerURL = _DefaultServerURL
-	}
-	opts.ServerURL = strings.TrimRight(opts.ServerURL, "/")
+	o.ServerURL = strings.TrimRight(o.ServerURL, "/")
 
 	api := webrtc.NewAPI()
-	if opts.SettingEngine != nil {
-		api = webrtc.NewAPI(webrtc.WithSettingEngine(*opts.SettingEngine))
+	if o.SettingEngine != nil {
+		api = webrtc.NewAPI(webrtc.WithSettingEngine(*o.SettingEngine))
 	}
 	ctx, stop := context.WithCancel(context.Background())
-	return &Client{api: api, opts: opts, bus: newBus(), ctx: ctx, stop: stop}, nil
+	return &Client{api: api, opts: o, bus: newBus(), ctx: ctx, stop: stop}, nil
 }
 
 func (c *Client) pubKeyRaw() ed25519.PublicKey {

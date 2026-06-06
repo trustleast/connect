@@ -45,14 +45,14 @@ func run() error {
 
 	trace := newSignalTrace()
 	inboundResult := make(chan inboundConnection, 1)
-	client, err := connect.New(connect.Options{
-		ServerURL: *serverURL,
-		OnSignal:  trace.observe,
-		AcceptConnection: func(remotePubkey string) bool {
+	client, err := connect.New(
+		connect.WithServerURL(*serverURL),
+		connect.WithOnSignal(trace.observe),
+		connect.WithAcceptConnection(func(remotePubkey string) bool {
 			fmt.Fprintf(os.Stderr, "accepting inbound connection from %s\n", shortKey(remotePubkey))
 			return true
-		},
-		OnIncoming: func(pc *webrtc.PeerConnection, remotePubkey string) {
+		}),
+		connect.WithOnIncoming(func(pc *webrtc.PeerConnection, remotePubkey string) {
 			fmt.Fprintf(os.Stderr, "inbound offer accepted from %s\n", shortKey(remotePubkey))
 			result := inboundConnection{remotePubkey: remotePubkey, done: make(chan error, 1)}
 			inboundResult <- result
@@ -69,8 +69,8 @@ func run() error {
 					}
 				}
 			})
-		},
-	})
+		}),
+	)
 
 	if err != nil {
 		return fail("spec-tester.client.create", "create spec client: %v", err)

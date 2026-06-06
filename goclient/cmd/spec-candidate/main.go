@@ -35,17 +35,17 @@ func run() error {
 	defer cancel()
 
 	inboundDone := make(chan error, 1)
-	client, err := connect.New(connect.Options{
-		ServerURL: serverURL,
-		AcceptConnection: func(remotePubkey string) bool {
+	client, err := connect.New(
+		connect.WithServerURL(serverURL),
+		connect.WithAcceptConnection(func(remotePubkey string) bool {
 			return true
-		},
-		OnIncoming: func(pc *webrtc.PeerConnection, remotePubkey string) {
+		}),
+		connect.WithOnIncoming(func(pc *webrtc.PeerConnection, remotePubkey string) {
 			pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 				respondToChallenge(dc, inboundDone)
 			})
-		},
-	})
+		}),
+	)
 	if err != nil {
 		return fmt.Errorf("create candidate client: %w", err)
 	}
