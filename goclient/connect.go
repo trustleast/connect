@@ -38,8 +38,8 @@ var defaultConfiguration = webrtc.Configuration{
 	},
 }
 
-// Options configures a Client.
-type Options struct {
+// options configures a Client.
+type options struct {
 	ServerURL     string
 	Configuration webrtc.Configuration // defaults to Google STUN if empty
 	SettingEngine *webrtc.SettingEngine
@@ -59,47 +59,47 @@ type Options struct {
 }
 
 // Option is a functional option for configuring a Client.
-type Option func(*Options)
+type Option func(*options)
 
 // WithServerURL sets the relay server URL.
 func WithServerURL(url string) Option {
-	return func(o *Options) { o.ServerURL = url }
+	return func(o *options) { o.ServerURL = url }
 }
 
 // WithConfiguration sets the WebRTC configuration (ICE servers, etc.).
 func WithConfiguration(cfg webrtc.Configuration) Option {
-	return func(o *Options) { o.Configuration = cfg }
+	return func(o *options) { o.Configuration = cfg }
 }
 
 // WithSettingEngine sets the pion SettingEngine for advanced WebRTC tuning.
 func WithSettingEngine(se *webrtc.SettingEngine) Option {
-	return func(o *Options) { o.SettingEngine = se }
+	return func(o *options) { o.SettingEngine = se }
 }
 
 // WithPrivateKey sets the ed25519 private key used for signing. If not set, a
 // key is generated automatically.
 func WithPrivateKey(key ed25519.PrivateKey) Option {
-	return func(o *Options) { o.PrivateKey = key }
+	return func(o *options) { o.PrivateKey = key }
 }
 
 // WithAcceptConnection sets the callback that decides whether to accept an
 // incoming offer. Return false to silently drop the offer. If not set, all
 // offers are denied.
 func WithAcceptConnection(fn func(remotePubkey string) bool) Option {
-	return func(o *Options) { o.AcceptConnection = fn }
+	return func(o *options) { o.AcceptConnection = fn }
 }
 
 // WithOnIncoming sets the callback invoked when an incoming offer has been
 // verified and accepted, before the answer is sent.
 func WithOnIncoming(fn func(pc *webrtc.PeerConnection, remotePubkey string)) Option {
-	return func(o *Options) { o.OnIncoming = fn }
+	return func(o *options) { o.OnIncoming = fn }
 }
 
 // WithOnSignal sets a callback that observes every raw signaling payload sent
 // or received. It is informational only; the callback cannot mutate or drop
 // messages.
 func WithOnSignal(fn func(SignalEvent)) Option {
-	return func(o *Options) { o.OnSignal = fn }
+	return func(o *options) { o.OnSignal = fn }
 }
 
 // SignalDirection identifies where a signaling payload was observed.
@@ -147,7 +147,7 @@ func makeConnKey(pubkey string, challenge []byte) connKey {
 // the bus; each connection runs its own sequential auth and ICE loop.
 type Client struct {
 	api  *webrtc.API
-	opts Options
+	opts options
 	bus  *bus
 	ctx  context.Context    // cancelled by Close
 	stop context.CancelFunc // cancels ctx
@@ -155,7 +155,7 @@ type Client struct {
 
 // New creates a Client. Call Listen to start receiving incoming connections.
 func New(opts ...Option) (*Client, error) {
-	o := Options{
+	o := options{
 		ServerURL:     _DefaultServerURL,
 		Configuration: defaultConfiguration,
 	}
