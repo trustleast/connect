@@ -85,22 +85,16 @@ type Config struct {
 	// NodeURL is this node's own base URL (e.g. "http://localhost:8081").
 	// Must be set for routing to be active; leave empty to serve all requests locally.
 	NodeURL *url.URL
-	// ClusterURL is the cluster/regional base URL (e.g. "http://localhost:8080").
-	// When set, GET requests arriving via this host are redirected to NodeURL so
-	// clients cache a stable node address for reconnection.
-	ClusterURL *url.URL
 	// ClusterSecret is the shared HMAC key for HRW scoring. All nodes in the
 	// cluster must use the same value. When empty, a zero key is used (dev only).
-	ClusterSecret string
+	ClusterSecret [32]byte
 }
 
 type server struct {
-	hub        *hub
-	peers      PeerFinder
-	nodeURL    *url.URL
-	clusterURL *url.URL
-	hashKey    [32]byte
-	framePool  sync.Pool
+	hub       *hub
+	cfg       Config
+	hashKey   [32]byte
+	framePool sync.Pool
 	// Auth pools — eliminate per-request heap allocations on the SSE connect path.
 	authDecodePool sync.Pool // _AuthMessageSize-byte buffers for base64-decoding ?sig=
 	authMsgPool    sync.Pool // ed25519 message buffer pre-filled with sseAuthDomain
@@ -123,11 +117,8 @@ func NewHTTPServer(ctx context.Context, cfg Config) *http.Server {
 
 func newServer(ctx context.Context, cfg Config) *server {
 	return &server{
-		hub:        newHub(ctx),
-		peers:      cfg.PeerFinder,
-		nodeURL:    cfg.NodeURL,
-		clusterURL: cfg.ClusterURL,
-		hashKey:    sha256.Sum256([]byte(cfg.ClusterSecret)),
+		hub: newHub(ctx),
+		cfg: cfg,
 		framePool: sync.Pool{
 			New: func() any {
 				b := make([]byte, _FrameSize)
@@ -159,10 +150,7 @@ func newServer(ctx context.Context, cfg Config) *server {
 // specific node. HRW minimises churn: only keys assigned to an added/removed
 // node are reassigned.
 func (s *server) targetPeer(pubkeyStr string) *url.URL {
-	if s.peers == nil || s.nodeURL == nil {
-		return nil
-	}
-	peers := s.peers.Peers()
+	peers := s.cfg.PeerFinder.Peers()
 	if len(peers) == 0 {
 		return nil
 	}
@@ -183,9 +171,6 @@ func (s *server) targetPeer(pubkeyStr string) *url.URL {
 		}
 	}
 
-	if best.Host == s.nodeURL.Host {
-		return nil
-	}
 	return best
 }
 
@@ -209,32 +194,29 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if target := s.targetPeer(pubKey); target != nil {
-		// Another node is the HRW owner. Before redirecting, check whether the
-		// request already arrived with the target's hostname — this means the
-		// client followed a previous redirect to that node but DNS fell through
-		// to us (e.g. CNAME drain). Redirecting again would loop; return 503 so
-		// the client backs off until the routing table converges.
-		if r.Host == target.Host {
+	// Check if cluster routing is enabled
+	if s.cfg.clusterRoutingEnabled() {
+		if target := s.targetPeer(pubKey); target == nil {
+			// Cluster routing enabled but no peers found
 			http.Error(w, errNodeUnavailable.Error(), http.StatusServiceUnavailable)
 			return
+		} else {
+			// Another node is the HRW owner. Before redirecting, check whether the
+			// request already arrived with the target's hostname — this means the
+			// client followed a previous redirect to that node but DNS fell through
+			// to us (e.g. CNAME drain). We can't find the good node yet; return 503 so
+			// the client backs off until the routing table converges.
+			if r.Host == target.Host && r.Host != s.cfg.NodeURL.Host {
+				http.Error(w, errNodeUnavailable.Error(), http.StatusServiceUnavailable)
+				return
+			} else if r.Host != target.Host {
+				u := *target
+				u.Path = r.URL.Path
+				u.RawQuery = r.URL.RawQuery
+				http.Redirect(w, r, u.String(), http.StatusTemporaryRedirect)
+				return
+			}
 		}
-		u := *target
-		u.Path = r.URL.Path
-		u.RawQuery = r.URL.RawQuery
-		http.Redirect(w, r, u.String(), http.StatusTemporaryRedirect)
-		return
-	}
-
-	// This node is the HRW owner (or routing is disabled in single-node mode).
-	// Redirect GET requests that arrived via the cluster hostname to the stable
-	// node URL so the client caches a direct address for reconnection.
-	if r.Method == http.MethodGet && s.clusterURL != nil && r.Host == s.clusterURL.Host {
-		u := *s.nodeURL
-		u.Path = r.URL.Path
-		u.RawQuery = r.URL.RawQuery
-		http.Redirect(w, r, u.String(), http.StatusTemporaryRedirect)
-		return
 	}
 
 	switch r.Method {
@@ -433,4 +415,8 @@ func (s *server) postMessage(w http.ResponseWriter, r *http.Request, targetStr s
 	}
 
 	w.WriteHeader(http.StatusAccepted)
+}
+
+func (c Config) clusterRoutingEnabled() bool {
+	return c.NodeURL != nil && c.PeerFinder != nil
 }

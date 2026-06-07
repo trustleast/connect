@@ -21,7 +21,7 @@ func TestEndToEnd(t *testing.T) {
 	receiverStr := base64.RawURLEncoding.EncodeToString(receiverPub)
 
 	// Receiver opens SSE stream.
-	sse := connectSSE(t, srv.URL, receiverPub, receiverPriv)
+	sse := connectSSE(t, srv.URL, receiverPriv)
 	defer sse.Body.Close()
 
 	// Read the first data line from SSE in the background.

@@ -17,8 +17,15 @@ import (
 
 var testSDP = []byte(base64.StdEncoding.EncodeToString([]byte("v=0\r\no=- 4611731400430051336 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=ice-ufrag:test\r\na=ice-pwd:testpassword\r\na=fingerprint:sha-256 AA:BB:CC\r\na=setup:actpass\r\na=mid:0\r\n")))
 
-func connectSSE(tb testing.TB, serverURL string, pub ed25519.PublicKey, priv ed25519.PrivateKey) *http.Response {
+func connectSSE(tb testing.TB, serverURL string, priv ed25519.PrivateKey) *http.Response {
 	tb.Helper()
+
+	pubRaw := priv.Public()
+	pub, ok := pubRaw.(ed25519.PublicKey)
+	if !ok {
+		tb.Fatalf("invalid public key type: %T", pubRaw)
+	}
+
 	pubStr := base64.RawURLEncoding.EncodeToString(pub)
 
 	tsBytes := make([]byte, 8)
@@ -57,7 +64,7 @@ func BenchmarkSSERoundtrip(b *testing.B) {
 	receiverPub, receiverPriv, _ := ed25519.GenerateKey(nil)
 	receiverStr := base64.RawURLEncoding.EncodeToString(receiverPub)
 
-	sse := connectSSE(b, srv.URL, receiverPub, receiverPriv)
+	sse := connectSSE(b, srv.URL, receiverPriv)
 	defer sse.Body.Close()
 
 	delivered := make(chan string, 1)
@@ -121,7 +128,7 @@ func BenchmarkSSEConnect(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		k := pool[i%poolSize]
-		resp := connectSSE(b, srv.URL, k.pub, k.priv)
+		resp := connectSSE(b, srv.URL, k.priv)
 		if old := open[i%poolSize]; old != nil {
 			old.Body.Close()
 		}
