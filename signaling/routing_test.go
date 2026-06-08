@@ -23,9 +23,13 @@ type routingPeerFinder struct {
 }
 
 func newRoutingPeerFinder(peers ...*url.URL) *routingPeerFinder {
-	return &routingPeerFinder{peers: peers, onChange: make(chan struct{})}
+	return &routingPeerFinder{
+		peers:    peers,
+		onChange: make(chan struct{}),
+	}
 }
 
+func (f *routingPeerFinder) Node() *url.URL            { return f.peers[0] }
 func (f *routingPeerFinder) Peers() []*url.URL         { return f.peers }
 func (f *routingPeerFinder) OnChange() <-chan struct{} { return f.onChange }
 func (f *routingPeerFinder) Secret() [32]byte {
@@ -99,7 +103,7 @@ func getStreamHost(t *testing.T, client *http.Client, serverURL, host string, pr
 // TestSingleNode verifies that a server with no PeerFinder serves all requests
 // locally without redirecting.
 func TestSingleNode(t *testing.T) {
-	srv := httptest.NewServer(newServer(t.Context(), Config{}))
+	srv := httptest.NewServer(newServer(t.Context(), nil))
 	defer srv.Close()
 
 	pub, _, err := ed25519.GenerateKey(nil)
@@ -125,11 +129,8 @@ func TestSingleNode(t *testing.T) {
 // no keys are redirected.
 func TestSinglePeerRedirectsToSingleNode(t *testing.T) {
 	nodeA := mustParseURL(t, "http://node-singlepeer.test")
-	cfg := Config{
-		PeerFinder: newRoutingPeerFinder(nodeA),
-		NodeURL:    nodeA,
-	}
-	srv := httptest.NewServer(newServer(t.Context(), cfg))
+	pf := newRoutingPeerFinder(nodeA)
+	srv := httptest.NewServer(newServer(t.Context(), pf))
 	defer srv.Close()
 
 	pub, priv, err := ed25519.GenerateKey(nil)
@@ -201,12 +202,7 @@ func TestTwoNodeRouting(t *testing.T) {
 
 	// Server under test acts as nodeA.
 	pf := newRoutingPeerFinder(peers...)
-	cfg := Config{
-		PeerFinder:    pf,
-		NodeURL:       nodeA,
-		ClusterSecret: sha256.Sum256([]byte(routingSecret)),
-	}
-	s := newServer(t.Context(), cfg)
+	s := newServer(t.Context(), pf)
 	srv := httptest.NewServer(s)
 	defer srv.Close()
 
@@ -268,12 +264,7 @@ func TestLoopDetection(t *testing.T) {
 	peers := []*url.URL{nodeA, nodeB}
 
 	pf := newRoutingPeerFinder(peers...)
-	cfg := Config{
-		PeerFinder:    pf,
-		NodeURL:       nodeA,
-		ClusterSecret: sha256.Sum256([]byte(routingSecret)),
-	}
-	s := newServer(t.Context(), cfg)
+	s := newServer(t.Context(), pf)
 	srv := httptest.NewServer(s)
 	defer srv.Close()
 
@@ -304,12 +295,7 @@ func TestClusterRedirect(t *testing.T) {
 	peers := []*url.URL{nodeA, nodeB}
 
 	pf := newRoutingPeerFinder(peers...)
-	cfg := Config{
-		PeerFinder:    pf,
-		NodeURL:       nodeA,
-		ClusterSecret: sha256.Sum256([]byte(routingSecret)),
-	}
-	s := newServer(t.Context(), cfg)
+	s := newServer(t.Context(), pf)
 	srv := httptest.NewServer(s)
 	defer srv.Close()
 

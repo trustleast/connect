@@ -58,7 +58,7 @@ func postSDP(client *http.Client, serverURL, targetPubStr string, body []byte) *
 // BenchmarkSSERoundtrip measures end-to-end delivery: POST entering the server
 // to the message appearing on the receiver's SSE stream.
 func BenchmarkSSERoundtrip(b *testing.B) {
-	srv := httptest.NewServer(newServer(b.Context(), Config{}))
+	srv := httptest.NewServer(newServer(b.Context(), nil))
 	defer srv.Close()
 
 	receiverPub, receiverPriv, _ := ed25519.GenerateKey(nil)
@@ -108,7 +108,7 @@ func BenchmarkSSERoundtrip(b *testing.B) {
 // path. A pool of 256 pubkeys is reused in rotation — each new connection
 // evicts its predecessor, keeping the hub size bounded at 256 entries.
 func BenchmarkSSEConnect(b *testing.B) {
-	srv := httptest.NewServer(newServer(b.Context(), Config{}))
+	srv := httptest.NewServer(newServer(b.Context(), nil))
 	defer srv.Close()
 
 	const poolSize = 256

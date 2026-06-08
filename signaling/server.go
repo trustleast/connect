@@ -68,6 +68,8 @@ var (
 // peer set to select the canonical node for each pubkey; requests for keys not
 // owned by this node are redirected to the owner.
 type PeerFinder interface {
+	// Node returns this node's own base URL.
+	Node() *url.URL
 	// Peers returns the current peer set including this node's own URL.
 	Peers() []*url.URL
 	// OnChange returns a channel that receives an empty signal whenever the peer
@@ -79,31 +81,20 @@ type PeerFinder interface {
 	Secret() [32]byte
 }
 
-// Config holds optional server configuration.
-type Config struct {
+type server struct {
+	hub *hub
 	// PeerFinder provides the current peer set. If nil or returns an empty
 	// slice, all requests are served locally (single-node / dev mode).
-	PeerFinder PeerFinder
-	// NodeURL is this node's own base URL (e.g. "http://localhost:8081").
-	// Must be set for routing to be active; leave empty to serve all requests locally.
-	NodeURL *url.URL
-	// ClusterSecret is the shared HMAC key for HRW scoring. All nodes in the
-	// cluster must use the same value. When empty, a zero key is used (dev only).
-	ClusterSecret [32]byte
-}
-
-type server struct {
-	hub       *hub
-	cfg       Config
-	hashKey   [32]byte
-	framePool sync.Pool
+	peerFinder PeerFinder
+	hashKey    [32]byte
+	framePool  sync.Pool
 	// Auth pools — eliminate per-request heap allocations on the SSE connect path.
 	authDecodePool sync.Pool // _AuthMessageSize-byte buffers for base64-decoding ?sig=
 	authMsgPool    sync.Pool // ed25519 message buffer pre-filled with sseAuthDomain
 }
 
-func NewHTTPServer(ctx context.Context, cfg Config) *http.Server {
-	server := newServer(ctx, cfg)
+func NewHTTPServer(ctx context.Context, peerFinder PeerFinder) *http.Server {
+	server := newServer(ctx, peerFinder)
 	return &http.Server{
 		Handler: server,
 		// Disable HTTP/2: ServeTLS enables it automatically via ALPN, but
@@ -117,10 +108,10 @@ func NewHTTPServer(ctx context.Context, cfg Config) *http.Server {
 	}
 }
 
-func newServer(ctx context.Context, cfg Config) *server {
+func newServer(ctx context.Context, peerFinder PeerFinder) *server {
 	return &server{
-		hub: newHub(ctx, cfg.PeerFinder),
-		cfg: cfg,
+		hub:        newHub(ctx, peerFinder),
+		peerFinder: peerFinder,
 		framePool: sync.Pool{
 			New: func() any {
 				b := make([]byte, _FrameSize)
@@ -199,8 +190,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if cluster routing is enabled
-	if s.cfg.clusterRoutingEnabled() {
-		if target := targetPeer(s.cfg.PeerFinder, pubKey); target == nil {
+	if s.peerFinder != nil {
+		if target := targetPeer(s.peerFinder, pubKey); target == nil {
 			// Cluster routing enabled but no peers found
 			http.Error(w, errNodeUnavailable.Error(), http.StatusServiceUnavailable)
 			return
@@ -210,7 +201,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// client followed a previous redirect to that node but DNS fell through
 			// to us (e.g. CNAME drain). We can't find the good node yet; return 503 so
 			// the client backs off until the routing table converges.
-			if r.Host == target.Host && r.Host != s.cfg.NodeURL.Host {
+			if r.Host == target.Host && r.Host != s.peerFinder.Node().Host {
 				http.Error(w, errNodeUnavailable.Error(), http.StatusServiceUnavailable)
 				return
 			} else if r.Host != target.Host {
@@ -419,8 +410,4 @@ func (s *server) postMessage(w http.ResponseWriter, r *http.Request, targetStr s
 	}
 
 	w.WriteHeader(http.StatusAccepted)
-}
-
-func (c Config) clusterRoutingEnabled() bool {
-	return c.NodeURL != nil && c.PeerFinder != nil
 }

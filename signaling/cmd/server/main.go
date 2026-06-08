@@ -102,17 +102,39 @@ func getConfig(ctx context.Context) (serverConfig, error) {
 }
 
 func (cfg serverConfig) getPeerFinder(ctx context.Context) (connect.PeerFinder, error) {
+	if cfg.ZoneName == "" {
+		return nil, nil
+	}
+
+	scheme := "https"
+	if cfg.Cert == "" {
+		scheme = "http"
+	}
+
+	ip, err := getPublicIP()
+	if err != nil {
+		return nil, fmt.Errorf("getting public IP: %w", err)
+	}
+
+	u, err := ipNodeURL(ip, cfg.ZoneName, scheme)
+	if err != nil {
+		return nil, fmt.Errorf("detecting node URL: %w", err)
+	}
+	if u == nil {
+		return nil, fmt.Errorf("no public IPv6 address found on any interface; cannot derive node URL for zone %q", cfg.ZoneName)
+	}
+
 	switch {
-	case cfg.ASG != "" && cfg.ZoneName != "":
+	case cfg.ASG != "":
 		awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(cfg.AWSRegion))
 		if err != nil {
 			return nil, fmt.Errorf("loading AWS config for peer finder: %w", err)
 		}
-		pf := newEC2PeerFinder(ec2svc.NewFromConfig(awsCfg), cfg.ASG, cfg.ZoneName, "https", cfg.ClusterSecret)
+		pf := newEC2PeerFinder(ec2svc.NewFromConfig(awsCfg), u, cfg.ASG, cfg.ZoneName, scheme, cfg.ClusterSecret)
 		pf.start(ctx)
 		return pf, nil
 	case len(cfg.Peers) > 0:
-		return newStaticPeerFinder(cfg.Peers, cfg.ClusterSecret)
+		return newStaticPeerFinder(u, cfg.Peers, cfg.ClusterSecret)
 	}
 
 	return nil, nil
@@ -150,9 +172,7 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("listen %s %s: %w", cfg.Network, cfg.Addr, err)
 	}
 
-	scheme := "http"
 	if cfg.Cert != "" {
-		scheme = "https"
 		tlsCfg, err := buildTLS(cfg.Cert, cfg.Key)
 		if err != nil {
 			return fmt.Errorf("building TLS config: %w", err)
@@ -160,28 +180,7 @@ func run(ctx context.Context) error {
 		ln = tls.NewListener(ln, tlsCfg)
 	}
 
-	connectCfg := connect.Config{
-		PeerFinder:    peerFinder,
-		ClusterSecret: sha256.Sum256([]byte(cfg.ClusterSecret)),
-	}
-	if cfg.ZoneName != "" {
-		ip, err := getPublicIP()
-		if err != nil {
-			return fmt.Errorf("getting public IP: %w", err)
-		}
-
-		u, err := ipNodeURL(ip, cfg.ZoneName, scheme)
-		if err != nil {
-			return fmt.Errorf("detecting node URL: %w", err)
-		}
-		if u == nil {
-			return fmt.Errorf("no public IPv6 address found on any interface; cannot derive node URL for zone %q", cfg.ZoneName)
-		}
-		connectCfg.NodeURL = u
-		log.Printf("node URL: %s", u)
-	}
-
-	srv := connect.NewHTTPServer(ctx, connectCfg)
+	srv := connect.NewHTTPServer(ctx, peerFinder)
 	return srv.Serve(ln)
 }
 
@@ -239,12 +238,13 @@ func buildTLS(certB64, keyB64 string) (*tls.Config, error) {
 // staticPeerFinder implements connect.PeerFinder for a fixed peer list.
 // OnChange returns a channel that is never written to because the peer set never changes.
 type staticPeerFinder struct {
+	nodeURL  *url.URL
 	peers    []*url.URL
 	onChange chan struct{}
 	secret   [32]byte
 }
 
-func newStaticPeerFinder(peerStrs []string, secret string) (*staticPeerFinder, error) {
+func newStaticPeerFinder(nodeURL *url.URL, peerStrs []string, secret string) (*staticPeerFinder, error) {
 	peerURLs := make([]*url.URL, 0, len(peerStrs))
 	for _, p := range peerStrs {
 		u, err := url.Parse(strings.TrimSpace(p))
@@ -254,12 +254,14 @@ func newStaticPeerFinder(peerStrs []string, secret string) (*staticPeerFinder, e
 		peerURLs = append(peerURLs, u)
 	}
 	return &staticPeerFinder{
+		nodeURL:  nodeURL,
 		peers:    peerURLs,
 		onChange: make(chan struct{}),
 		secret:   sha256.Sum256([]byte(secret)),
 	}, nil
 }
 
+func (f *staticPeerFinder) Node() *url.URL            { return f.nodeURL }
 func (f *staticPeerFinder) Peers() []*url.URL         { return f.peers }
 func (f *staticPeerFinder) OnChange() <-chan struct{} { return f.onChange }
 func (f *staticPeerFinder) Secret() [32]byte          { return f.secret }
@@ -268,6 +270,7 @@ func (f *staticPeerFinder) Secret() [32]byte          { return f.secret }
 // and exposes their node URLs for pubkey-based routing.
 type ec2PeerFinder struct {
 	mu       sync.RWMutex
+	nodeURL  *url.URL
 	peers    []*url.URL
 	onChange chan struct{}
 	ec2      *ec2svc.Client
@@ -277,7 +280,7 @@ type ec2PeerFinder struct {
 	secret   [32]byte
 }
 
-func newEC2PeerFinder(client *ec2svc.Client, asgName, zoneName, scheme, secret string) *ec2PeerFinder {
+func newEC2PeerFinder(client *ec2svc.Client, nodeURL *url.URL, asgName, zoneName, scheme, secret string) *ec2PeerFinder {
 	return &ec2PeerFinder{
 		onChange: make(chan struct{}, 1),
 		secret:   sha256.Sum256([]byte(secret)),
@@ -285,7 +288,17 @@ func newEC2PeerFinder(client *ec2svc.Client, asgName, zoneName, scheme, secret s
 		asgName:  asgName,
 		zoneName: zoneName,
 		scheme:   scheme,
+		nodeURL:  nodeURL,
 	}
+}
+
+func (f *ec2PeerFinder) Node() *url.URL {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if len(f.peers) == 0 {
+		return nil
+	}
+	return f.peers[0]
 }
 
 func (f *ec2PeerFinder) Peers() []*url.URL {
