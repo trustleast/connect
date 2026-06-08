@@ -38,7 +38,6 @@ type serverConfig struct {
 	Key           string
 	ASG           string
 	Addr          string
-	ClusterURL    string
 	ZoneName      string
 	ClusterSecret string
 	Peers         []string
@@ -60,7 +59,6 @@ func getConfig(ctx context.Context) (serverConfig, error) {
 	addr := flag.String("addr", cfg.Addr, "listen address")
 	network := flag.String("network", cfg.Network, "listen network (tcp, tcp4, tcp6)")
 	configS3 := flag.String("config-s3", "", "S3 URI for JSON instance config, e.g. s3://bucket/key")
-	clusterURL := flag.String("cluster-url", "", "cluster/regional base URL, e.g. https://us-east.example.com")
 	clusterSecret := flag.String("cluster-secret", "", "shared HRW hash secret; all nodes must use the same value")
 	peers := flag.String("peers", "", "comma-separated static peer base URLs, e.g. http://localhost:8081,http://localhost:8082")
 	zoneName := flag.String("zone-name", "", "DNS zone for peer URL derivation, e.g. example.com")
@@ -91,8 +89,6 @@ func getConfig(ctx context.Context) (serverConfig, error) {
 			cfg.Addr = *addr
 		case "network":
 			cfg.Network = *network
-		case "cluster-url":
-			cfg.ClusterURL = *clusterURL
 		case "cluster-secret":
 			cfg.ClusterSecret = *clusterSecret
 		case "peers":
@@ -112,19 +108,11 @@ func (cfg serverConfig) getPeerFinder(ctx context.Context) (connect.PeerFinder, 
 		if err != nil {
 			return nil, fmt.Errorf("loading AWS config for peer finder: %w", err)
 		}
-		pf := newEC2PeerFinder(ec2svc.NewFromConfig(awsCfg), cfg.ASG, cfg.ZoneName, "https")
+		pf := newEC2PeerFinder(ec2svc.NewFromConfig(awsCfg), cfg.ASG, cfg.ZoneName, "https", cfg.ClusterSecret)
 		pf.start(ctx)
 		return pf, nil
 	case len(cfg.Peers) > 0:
-		peerURLs := make([]*url.URL, 0, len(cfg.Peers))
-		for _, p := range cfg.Peers {
-			u, err := url.Parse(strings.TrimSpace(p))
-			if err != nil {
-				return nil, fmt.Errorf("invalid peer URL %q: %w", p, err)
-			}
-			peerURLs = append(peerURLs, u)
-		}
-		return &staticPeerFinder{peers: peerURLs, onChange: make(chan struct{})}, nil
+		return newStaticPeerFinder(cfg.Peers, cfg.ClusterSecret)
 	}
 
 	return nil, nil
@@ -192,13 +180,6 @@ func run(ctx context.Context) error {
 		connectCfg.NodeURL = u
 		log.Printf("node URL: %s", u)
 	}
-	if cfg.ClusterURL != "" {
-		u, err := url.Parse(cfg.ClusterURL)
-		if err != nil {
-			return fmt.Errorf("invalid -cluster-url %q: %w", cfg.ClusterURL, err)
-		}
-		connectCfg.ClusterURL = u
-	}
 
 	srv := connect.NewHTTPServer(ctx, connectCfg)
 	return srv.Serve(ln)
@@ -260,10 +241,28 @@ func buildTLS(certB64, keyB64 string) (*tls.Config, error) {
 type staticPeerFinder struct {
 	peers    []*url.URL
 	onChange chan struct{}
+	secret   [32]byte
+}
+
+func newStaticPeerFinder(peerStrs []string, secret string) (*staticPeerFinder, error) {
+	peerURLs := make([]*url.URL, 0, len(peerStrs))
+	for _, p := range peerStrs {
+		u, err := url.Parse(strings.TrimSpace(p))
+		if err != nil {
+			return nil, err
+		}
+		peerURLs = append(peerURLs, u)
+	}
+	return &staticPeerFinder{
+		peers:    peerURLs,
+		onChange: make(chan struct{}),
+		secret:   sha256.Sum256([]byte(secret)),
+	}, nil
 }
 
 func (f *staticPeerFinder) Peers() []*url.URL         { return f.peers }
 func (f *staticPeerFinder) OnChange() <-chan struct{} { return f.onChange }
+func (f *staticPeerFinder) Secret() [32]byte          { return f.secret }
 
 // ec2PeerFinder periodically queries EC2 for all running instances in an ASG
 // and exposes their node URLs for pubkey-based routing.
@@ -275,11 +274,13 @@ type ec2PeerFinder struct {
 	asgName  string
 	zoneName string
 	scheme   string
+	secret   [32]byte
 }
 
-func newEC2PeerFinder(client *ec2svc.Client, asgName, zoneName, scheme string) *ec2PeerFinder {
+func newEC2PeerFinder(client *ec2svc.Client, asgName, zoneName, scheme, secret string) *ec2PeerFinder {
 	return &ec2PeerFinder{
 		onChange: make(chan struct{}, 1),
+		secret:   sha256.Sum256([]byte(secret)),
 		ec2:      client,
 		asgName:  asgName,
 		zoneName: zoneName,
@@ -360,6 +361,10 @@ func (f *ec2PeerFinder) start(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+func (f *ec2PeerFinder) Secret() [32]byte {
+	return f.secret
 }
 
 // instanceIP returns the first public IPv6 address on the instance, preferring

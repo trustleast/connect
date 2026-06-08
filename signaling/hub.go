@@ -26,12 +26,39 @@ type conn struct {
 // newHub creates a hub and starts a single shared keepalive ticker that sends
 // SSE keep-alive comments to all active connections. The ticker runs until ctx
 // is cancelled, at which point all connections are closed.
-func newHub(ctx context.Context) *hub {
+func newHub(ctx context.Context, peerFinder PeerFinder) *hub {
 	h := &hub{}
+	go h.cleanUnownedConnections(ctx, peerFinder)
 	go h.keepalive(ctx)
 	return h
 }
 
+func (h *hub) cleanUnownedConnections(ctx context.Context, peerFinder PeerFinder) {
+	if peerFinder == nil {
+		return
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-peerFinder.OnChange():
+			if !ok {
+				return
+			}
+
+			h.clients.Range(func(k, val any) bool {
+				pubkey := k.(string)
+				if target := targetPeer(peerFinder, pubkey); target == nil {
+					c := val.(*conn)
+					if h.clients.CompareAndDelete(k, c) {
+						c.nc.Close()
+					}
+				}
+				return true
+			})
+		}
+	}
+}
 func (h *hub) keepalive(ctx context.Context) {
 	tick := time.NewTicker(20 * time.Second)
 	defer tick.Stop()

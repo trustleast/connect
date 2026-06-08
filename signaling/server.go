@@ -75,6 +75,8 @@ type PeerFinder interface {
 	// after receiving a signal. Static implementations allocate the channel but
 	// never send on it.
 	OnChange() <-chan struct{}
+
+	Secret() [32]byte
 }
 
 // Config holds optional server configuration.
@@ -117,7 +119,7 @@ func NewHTTPServer(ctx context.Context, cfg Config) *http.Server {
 
 func newServer(ctx context.Context, cfg Config) *server {
 	return &server{
-		hub: newHub(ctx),
+		hub: newHub(ctx, cfg.PeerFinder),
 		cfg: cfg,
 		framePool: sync.Pool{
 			New: func() any {
@@ -149,16 +151,18 @@ func newServer(ctx context.Context, cfg Config) *server {
 // Using a keyed hash prevents clients from generating pubkeys that target a
 // specific node. HRW minimises churn: only keys assigned to an added/removed
 // node are reassigned.
-func (s *server) targetPeer(pubkeyStr string) *url.URL {
-	peers := s.cfg.PeerFinder.Peers()
+func targetPeer(pf PeerFinder, pubkeyStr string) *url.URL {
+	peers := pf.Peers()
 	if len(peers) == 0 {
 		return nil
 	}
 
+	secret := pf.Secret()
+
 	best := peers[0]
 	var bestScore uint64
 	var sum [sha256.Size]byte
-	mac := hmac.New(sha256.New, s.hashKey[:])
+	mac := hmac.New(sha256.New, secret[:])
 	for _, peer := range peers {
 		io.WriteString(mac, pubkeyStr)
 		mac.Write([]byte{0})
@@ -196,7 +200,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Check if cluster routing is enabled
 	if s.cfg.clusterRoutingEnabled() {
-		if target := s.targetPeer(pubKey); target == nil {
+		if target := targetPeer(s.cfg.PeerFinder, pubKey); target == nil {
 			// Cluster routing enabled but no peers found
 			http.Error(w, errNodeUnavailable.Error(), http.StatusServiceUnavailable)
 			return

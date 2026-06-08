@@ -28,20 +28,19 @@ func newRoutingPeerFinder(peers ...*url.URL) *routingPeerFinder {
 
 func (f *routingPeerFinder) Peers() []*url.URL         { return f.peers }
 func (f *routingPeerFinder) OnChange() <-chan struct{} { return f.onChange }
+func (f *routingPeerFinder) Secret() [32]byte {
+	return sha256.Sum256([]byte(routingSecret))
+}
 
 // keyOwnedBy generates ed25519 pubkeys until one's HRW owner matches wantHost.
-func keyOwnedBy(t *testing.T, s *server, wantHost string) (string, ed25519.PrivateKey) {
+func keyOwnedBy(t *testing.T, pf *routingPeerFinder, wantHost string) (string, ed25519.PrivateKey) {
 	t.Helper()
 	for {
 		pub, priv, err := ed25519.GenerateKey(nil)
-		if err != nil {
-			t.Fatal(err)
-		}
+		assertEqual(t, err, nil)
 		encoded := base64.RawURLEncoding.EncodeToString(pub)
-		target := s.targetPeer(encoded)
-		if target == nil {
-			t.Fatal("not found target")
-		}
+		target := targetPeer(pf, encoded)
+		assertEqual(t, target != nil, true)
 		if target.Host == wantHost {
 			return encoded, priv
 		}
@@ -61,9 +60,7 @@ const routingSecret = "test-cluster-secret"
 func mustParseURL(t *testing.T, raw string) *url.URL {
 	t.Helper()
 	u, err := url.Parse(raw)
-	if err != nil {
-		t.Fatalf("url.Parse(%q): %v", raw, err)
-	}
+	assertEqual(t, err, nil)
 	return u
 }
 
@@ -105,11 +102,13 @@ func TestSingleNode(t *testing.T) {
 	srv := httptest.NewServer(newServer(t.Context(), Config{}))
 	defer srv.Close()
 
-	pub, _, _ := ed25519.GenerateKey(nil)
+	pub, _, err := ed25519.GenerateKey(nil)
+	assertEqual(t, err, nil)
 	pubStr := base64.RawURLEncoding.EncodeToString(pub)
 
 	t.Run("GET_reaches_handler", func(t *testing.T) {
-		resp, _ := noRedirect.Get(srv.URL + "/" + pubStr)
+		resp, err := noRedirect.Get(srv.URL + "/" + pubStr)
+		assertEqual(t, err, nil)
 		resp.Body.Close()
 		assertEqual(t, resp.StatusCode, http.StatusUnauthorized)
 	})
@@ -117,13 +116,8 @@ func TestSingleNode(t *testing.T) {
 	t.Run("POST_reaches_handler", func(t *testing.T) {
 		resp := postSDP(noRedirect, srv.URL, pubStr, testSDP)
 		resp.Body.Close()
-		if resp.StatusCode == http.StatusTemporaryRedirect {
-			t.Fatalf("single-node POST: got unexpected redirect")
-		}
 		// Should reach delivery handler and return 404 (no SSE listener).
-		if resp.StatusCode != http.StatusNotFound {
-			t.Errorf("single-node POST: want 404, got %d", resp.StatusCode)
-		}
+		assertEqual(t, resp.StatusCode, http.StatusNotFound)
 	})
 }
 
@@ -132,14 +126,14 @@ func TestSingleNode(t *testing.T) {
 func TestSinglePeerRedirectsToSingleNode(t *testing.T) {
 	nodeA := mustParseURL(t, "http://node-singlepeer.test")
 	cfg := Config{
-		PeerFinder:    newRoutingPeerFinder(nodeA),
-		NodeURL:       nodeA,
-		ClusterSecret: sha256.Sum256([]byte(routingSecret)),
+		PeerFinder: newRoutingPeerFinder(nodeA),
+		NodeURL:    nodeA,
 	}
 	srv := httptest.NewServer(newServer(t.Context(), cfg))
 	defer srv.Close()
 
-	pub, priv, _ := ed25519.GenerateKey(nil)
+	pub, priv, err := ed25519.GenerateKey(nil)
+	assertEqual(t, err, nil)
 	pubStr := base64.RawURLEncoding.EncodeToString(pub)
 
 	t.Run("no_listener", func(t *testing.T) {
@@ -206,8 +200,9 @@ func TestTwoNodeRouting(t *testing.T) {
 	peers := []*url.URL{nodeA, nodeB}
 
 	// Server under test acts as nodeA.
+	pf := newRoutingPeerFinder(peers...)
 	cfg := Config{
-		PeerFinder:    newRoutingPeerFinder(peers...),
+		PeerFinder:    pf,
 		NodeURL:       nodeA,
 		ClusterSecret: sha256.Sum256([]byte(routingSecret)),
 	}
@@ -215,8 +210,8 @@ func TestTwoNodeRouting(t *testing.T) {
 	srv := httptest.NewServer(s)
 	defer srv.Close()
 
-	aPub, aPriv := keyOwnedBy(t, s, nodeA.Host)
-	bPub, _ := keyOwnedBy(t, s, nodeB.Host)
+	aPub, aPriv := keyOwnedBy(t, pf, nodeA.Host)
+	bPub, _ := keyOwnedBy(t, pf, nodeB.Host)
 
 	t.Run("GET_a_owned_redirects_to_owner", func(t *testing.T) {
 		resp := getStreamHost(t, noRedirect, srv.URL, "", aPriv)
@@ -244,7 +239,8 @@ func TestTwoNodeRouting(t *testing.T) {
 	})
 
 	t.Run("GET_other_owned_preserves_query_string", func(t *testing.T) {
-		resp, _ := noRedirect.Get(srv.URL + "/" + bPub + "?sig=abc123")
+		resp, err := noRedirect.Get(srv.URL + "/" + bPub + "?sig=abc123")
+		assertEqual(t, err, nil)
 		resp.Body.Close()
 		assertEqual(t, resp.StatusCode, http.StatusTemporaryRedirect)
 		want := nodeB.String() + "/" + bPub + "?sig=abc123"
@@ -271,8 +267,9 @@ func TestLoopDetection(t *testing.T) {
 	nodeB := mustParseURL(t, "http://node-b.test")
 	peers := []*url.URL{nodeA, nodeB}
 
+	pf := newRoutingPeerFinder(peers...)
 	cfg := Config{
-		PeerFinder:    newRoutingPeerFinder(peers...),
+		PeerFinder:    pf,
 		NodeURL:       nodeA,
 		ClusterSecret: sha256.Sum256([]byte(routingSecret)),
 	}
@@ -281,20 +278,19 @@ func TestLoopDetection(t *testing.T) {
 	defer srv.Close()
 
 	// Use a key owned by nodeB so that nodeA would normally redirect there.
-	otherKey, _ := keyOwnedBy(t, s, nodeB.Host)
+	otherKey, _ := keyOwnedBy(t, pf, nodeB.Host)
 
 	for _, method := range []string{http.MethodGet, http.MethodPost} {
 		t.Run(method, func(t *testing.T) {
-			req, _ := http.NewRequest(method, srv.URL+"/"+otherKey, nil)
+			req, err := http.NewRequest(method, srv.URL+"/"+otherKey, nil)
+			assertEqual(t, err, nil)
 			// Simulate arriving with nodeB's hostname — as if the client followed
 			// a redirect to node-b.test but DNS fell through to us.
 			req.Host = nodeB.Host
-			resp, _ := noRedirect.Do(req)
+			resp, err := noRedirect.Do(req)
+			assertEqual(t, err, nil)
 			resp.Body.Close()
-
-			if resp.StatusCode != http.StatusServiceUnavailable {
-				t.Errorf("loop detection %s: want 503, got %d", method, resp.StatusCode)
-			}
+			assertEqual(t, resp.StatusCode, http.StatusServiceUnavailable)
 		})
 	}
 }
@@ -307,8 +303,9 @@ func TestClusterRedirect(t *testing.T) {
 	cluster := mustParseURL(t, "http://cluster.test")
 	peers := []*url.URL{nodeA, nodeB}
 
+	pf := newRoutingPeerFinder(peers...)
 	cfg := Config{
-		PeerFinder:    newRoutingPeerFinder(peers...),
+		PeerFinder:    pf,
 		NodeURL:       nodeA,
 		ClusterSecret: sha256.Sum256([]byte(routingSecret)),
 	}
@@ -316,36 +313,32 @@ func TestClusterRedirect(t *testing.T) {
 	srv := httptest.NewServer(s)
 	defer srv.Close()
 
-	selfKey, _ := keyOwnedBy(t, s, nodeA.Host)
+	selfKey, _ := keyOwnedBy(t, pf, nodeA.Host)
 
 	t.Run("GET_via_cluster_redirects_to_node_URL", func(t *testing.T) {
-		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/"+selfKey, nil)
+		req, err := http.NewRequest(http.MethodGet, srv.URL+"/"+selfKey, nil)
+		assertEqual(t, err, nil)
 		req.Host = cluster.Host
-		resp, _ := noRedirect.Do(req)
+		resp, err := noRedirect.Do(req)
+		assertEqual(t, err, nil)
 		resp.Body.Close()
-
-		if resp.StatusCode != http.StatusTemporaryRedirect {
-			t.Fatalf("cluster GET: want 307, got %d", resp.StatusCode)
-		}
-		want := nodeA.String() + "/" + selfKey
-		if got := resp.Header.Get("Location"); got != want {
-			t.Errorf("cluster GET Location: want %s, got %s", want, got)
-		}
+		assertEqual(t, resp.StatusCode, http.StatusTemporaryRedirect)
+		loc, err := resp.Location()
+		assertEqual(t, err, nil)
+		assertEqual(t, loc.String(), nodeA.String()+"/"+selfKey)
 	})
 
 	t.Run("GET_via_cluster_preserves_query_string", func(t *testing.T) {
-		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/"+selfKey+"?sig=xyz", nil)
+		req, err := http.NewRequest(http.MethodGet, srv.URL+"/"+selfKey+"?sig=xyz", nil)
+		assertEqual(t, err, nil)
 		req.Host = cluster.Host
-		resp, _ := noRedirect.Do(req)
+		resp, err := noRedirect.Do(req)
+		assertEqual(t, err, nil)
 		resp.Body.Close()
-
-		if resp.StatusCode != http.StatusTemporaryRedirect {
-			t.Fatalf("cluster GET with query: want 307, got %d", resp.StatusCode)
-		}
-		want := nodeA.String() + "/" + selfKey + "?sig=xyz"
-		if got := resp.Header.Get("Location"); got != want {
-			t.Errorf("cluster GET Location with query: want %s, got %s", want, got)
-		}
+		assertEqual(t, resp.StatusCode, http.StatusTemporaryRedirect)
+		loc, err := resp.Location()
+		assertEqual(t, err, nil)
+		assertEqual(t, loc.String(), nodeA.String()+"/"+selfKey+"?sig=xyz")
 	})
 
 	t.Run("POST_via_cluster_redirects", func(t *testing.T) {
