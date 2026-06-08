@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net"
 	"net/http"
@@ -88,6 +89,11 @@ type server struct {
 	peerFinder PeerFinder
 	hashKey    [32]byte
 	framePool  sync.Pool
+	// hmacPool holds pre-keyed HMAC-SHA256 instances for the HRW routing path.
+	// Each item is a hash.Hash already keyed with the cluster secret; callers
+	// must Reset() after use before returning it to the pool. Populated only
+	// when peerFinder != nil.
+	hmacPool sync.Pool
 	// Auth pools — eliminate per-request heap allocations on the SSE connect path.
 	authDecodePool sync.Pool // _AuthMessageSize-byte buffers for base64-decoding ?sig=
 	authMsgPool    sync.Pool // ed25519 message buffer pre-filled with sseAuthDomain
@@ -109,7 +115,7 @@ func NewHTTPServer(ctx context.Context, peerFinder PeerFinder) *http.Server {
 }
 
 func newServer(ctx context.Context, peerFinder PeerFinder) *server {
-	return &server{
+	s := &server{
 		hub:        newHub(ctx, peerFinder),
 		peerFinder: peerFinder,
 		framePool: sync.Pool{
@@ -130,7 +136,15 @@ func newServer(ctx context.Context, peerFinder PeerFinder) *server {
 			},
 		},
 	}
-
+	if peerFinder != nil {
+		secret := peerFinder.Secret()
+		s.hmacPool = sync.Pool{
+			New: func() any {
+				return hmac.New(sha256.New, secret[:])
+			},
+		}
+	}
+	return s
 }
 
 // targetPeer returns the parsed URL of the peer that should handle pubkey using
@@ -147,26 +161,43 @@ func targetPeer(pf PeerFinder, pubkeyStr string) *url.URL {
 	if len(peers) == 0 {
 		return nil
 	}
-
 	secret := pf.Secret()
+	return targetPeerWith(peers, pubkeyStr, hmac.New(sha256.New, secret[:]))
+}
 
+// targetPeerWith scores peers using the provided pre-keyed hash h and returns
+// the HRW winner. h is Reset() after each peer's score so it is in the initial
+// keyed state when this function returns — callers that obtained h from a pool
+// can return it directly without an additional Reset().
+func targetPeerWith(peers []*url.URL, pubkeyStr string, h hash.Hash) *url.URL {
 	best := peers[0]
 	var bestScore uint64
 	var sum [sha256.Size]byte
-	mac := hmac.New(sha256.New, secret[:])
 	for _, peer := range peers {
-		io.WriteString(mac, pubkeyStr)
-		mac.Write([]byte{0})
-		io.WriteString(mac, peer.Host)
-		mac.Sum(sum[:0])
-		mac.Reset()
+		io.WriteString(h, pubkeyStr)
+		h.Write([]byte{0})
+		io.WriteString(h, peer.Host)
+		h.Sum(sum[:0])
+		h.Reset()
 		if score := binary.BigEndian.Uint64(sum[:8]); score > bestScore {
 			bestScore = score
 			best = peer
 		}
 	}
-
 	return best
+}
+
+// targetPeer is the hot-path method called from ServeHTTP. It uses the server's
+// pre-keyed HMAC pool so hmac.New is not called on every request.
+func (s *server) targetPeer(pubkeyStr string) *url.URL {
+	peers := s.peerFinder.Peers()
+	if len(peers) == 0 {
+		return nil
+	}
+	h := s.hmacPool.Get().(hash.Hash)
+	result := targetPeerWith(peers, pubkeyStr, h)
+	s.hmacPool.Put(h) // targetPeerWith leaves h Reset()-ed; ready for reuse
+	return result
 }
 
 // ServeHTTP routes:
@@ -191,9 +222,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Check if cluster routing is enabled
 	if s.peerFinder != nil {
-		if target := targetPeer(s.peerFinder, pubKey); target == nil {
+		if target := s.targetPeer(pubKey); target == nil {
 			// Cluster routing enabled but no peers found
-			http.Error(w, errNodeUnavailable.Error(), http.StatusServiceUnavailable)
+			respondAndDrain(r, w, http.StatusServiceUnavailable)
 			return
 		} else {
 			// Another node is the HRW owner. Before redirecting, check whether the
@@ -202,13 +233,13 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// to us (e.g. CNAME drain). We can't find the good node yet; return 503 so
 			// the client backs off until the routing table converges.
 			if r.Host == target.Host && r.Host != s.peerFinder.Node().Host {
-				http.Error(w, errNodeUnavailable.Error(), http.StatusServiceUnavailable)
+				respondAndDrain(r, w, http.StatusServiceUnavailable)
 				return
 			} else if r.Host != target.Host {
 				u := *target
 				u.Path = r.URL.Path
 				u.RawQuery = r.URL.RawQuery
-				http.Redirect(w, r, u.String(), http.StatusTemporaryRedirect)
+				redirectAndDrain(r, w, u.String())
 				return
 			}
 		}
@@ -410,4 +441,22 @@ func (s *server) postMessage(w http.ResponseWriter, r *http.Request, targetStr s
 	}
 
 	w.WriteHeader(http.StatusAccepted)
+}
+
+func respondAndDrain(r *http.Request, w http.ResponseWriter, status int) {
+	if r.Method == http.MethodPost {
+		// Read and discard the body to avoid leaking resources on the client side.
+		io.Copy(io.Discard, r.Body)
+		r.Body.Close()
+	}
+	w.WriteHeader(status)
+}
+
+func redirectAndDrain(r *http.Request, w http.ResponseWriter, target string) {
+	if r.Method == http.MethodPost {
+		// Read and discard the body to avoid leaking resources on the client side.
+		io.Copy(io.Discard, r.Body)
+		r.Body.Close()
+	}
+	http.Redirect(w, r, target, http.StatusTemporaryRedirect)
 }

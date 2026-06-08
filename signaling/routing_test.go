@@ -37,7 +37,7 @@ func (f *routingPeerFinder) Secret() [32]byte {
 }
 
 // keyOwnedBy generates ed25519 pubkeys until one's HRW owner matches wantHost.
-func keyOwnedBy(t *testing.T, pf *routingPeerFinder, wantHost string) (string, ed25519.PrivateKey) {
+func keyOwnedBy(t testing.TB, pf *routingPeerFinder, wantHost string) (string, ed25519.PrivateKey) {
 	t.Helper()
 	for {
 		pub, priv, err := ed25519.GenerateKey(nil)
@@ -61,7 +61,7 @@ var noRedirect = &http.Client{
 const routingSecret = "test-cluster-secret"
 
 // mustParseURL parses a URL and fatals on error.
-func mustParseURL(t *testing.T, raw string) *url.URL {
+func mustParseURL(t testing.TB, raw string) *url.URL {
 	t.Helper()
 	u, err := url.Parse(raw)
 	assertEqual(t, err, nil)
@@ -180,7 +180,7 @@ func TestSinglePeerRedirectsToSingleNode(t *testing.T) {
 	})
 }
 
-func assertEqual[T comparable](t *testing.T, got T, expected T) {
+func assertEqual[T comparable](t testing.TB, got T, expected T) {
 	if expected != got {
 		_, file, line, ok := runtime.Caller(1)
 		var preamble string
