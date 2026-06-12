@@ -69,7 +69,11 @@ type Option func(*options)
 
 // WithServerURL sets the relay server URL.
 func WithServerURL(url string) Option {
-	return func(o *options) { o.ServerURL = url }
+	return func(o *options) {
+		if url != "" {
+			o.ServerURL = url
+		}
+	}
 }
 
 // WithConfiguration sets the WebRTC configuration (ICE servers, etc.).

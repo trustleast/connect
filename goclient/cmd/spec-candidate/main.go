@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/pion/webrtc/v4"
 	connect "github.com/trustleast/connect/goclient"
@@ -20,8 +19,6 @@ func main() {
 }
 
 func run() error {
-	timeout := flag.Duration("timeout", 30*time.Second, "overall candidate timeout")
-	dialTimeout := flag.Duration("dial-timeout", 10*time.Second, "per-dial signaling timeout")
 	flag.Parse()
 
 	args := flag.Args()
@@ -31,7 +28,7 @@ func run() error {
 	serverURL := args[0]
 	remotePubkey := args[1]
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	inboundDone := make(chan error, 1)
@@ -56,11 +53,8 @@ func run() error {
 		listenErr <- client.Listen(ctx)
 	}()
 
-	dialCtx, dialCancel := context.WithTimeout(ctx, *dialTimeout)
-	defer dialCancel()
-
 	outboundDone := make(chan error, 1)
-	pc, err := client.Dial(dialCtx, remotePubkey, func(pc *webrtc.PeerConnection) {
+	pc, err := client.Dial(ctx, remotePubkey, func(pc *webrtc.PeerConnection) {
 		pc.CreateDataChannel("test", nil)
 		pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 			respondToChallenge(dc, outboundDone)
