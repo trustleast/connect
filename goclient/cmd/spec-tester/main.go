@@ -30,7 +30,7 @@ func main() {
 }
 
 func run() error {
-	serverURL := flag.String("server-url", getenv("CONNECT_URL", "https://connect.peerwave.ai"), "connect relay URL")
+	serverURL := flag.String("server-url", "", "connect relay URL")
 	timeout := flag.Duration("timeout", 30*time.Second, "overall spec timeout")
 	dialTimeout := flag.Duration("dial-timeout", 10*time.Second, "per-dial signaling timeout")
 	flag.Parse()
@@ -45,8 +45,7 @@ func run() error {
 
 	trace := newSignalTrace()
 	inboundResult := make(chan inboundConnection, 1)
-	client, err := connect.New(
-		connect.WithServerURL(*serverURL),
+	options := []connect.Option{
 		connect.WithOnSignal(trace.observe),
 		connect.WithAcceptConnection(func(remotePubkey string) bool {
 			fmt.Fprintf(os.Stderr, "accepting inbound connection from %s\n", shortKey(remotePubkey))
@@ -70,7 +69,13 @@ func run() error {
 				}
 			})
 		}),
-	)
+	}
+
+	if *serverURL != "" {
+		options = append(options, connect.WithServerURL(*serverURL))
+	}
+
+	client, err := connect.New(options...)
 
 	if err != nil {
 		return fail("spec-tester.client.create", "create spec client: %v", err)

@@ -10,18 +10,15 @@ The goal is to keep the relay simple enough that protocol changes live in client
 ## What This Is
 
 - A Go signaling server for relaying small opaque WebRTC signaling payloads.
+- Terraform modules under `terraform/` showing one way to run the relay on AWS with Cloudflare DNS registration.
 - A TypeScript client library in `jsclient/`.
 - A Go client library in `goclient/`.
-- An example browser chat app in `jsclient/example/`.
-- Terraform modules under `terraform/` showing one way to run the relay on AWS with Cloudflare DNS registration.
 
 ## What This Is Not
 
 - Not a TURN server.
 - Not a WebRTC media or data relay.
 - Not a user registry, identity provider, or key directory.
-- Not an audited authentication system.
-- Not a general message broker. Payloads are capped at 8 KB and are meant only for signaling.
 
 ## Design Intent
 
@@ -49,13 +46,11 @@ At a high level:
 
 Any verification failure closes the relevant `RTCPeerConnection`.
 
-Read [connection-flow.md](connection-flow.md) for the full sequence and security rationale. That document is design documentation, not an audit.
+Read [connection-flow.md](connection-flow.md) for the full sequence and security rationale.
 
 ## Creating New Clients
 
-New client libraries should preserve the server's dumb-pipe model: keep SDP,
-ICE, signing, session state, authorization, and cleanup semantics in the client,
-not the relay.
+Client libraries should do their best to minimize wrapping WebRTC and leaving the API as exposed as possible.
 
 Use [connection-flow.md](connection-flow.md) as the protocol spec, and run the
 [spec tester](goclient/cmd/spec-tester/README.md) against new implementations.
