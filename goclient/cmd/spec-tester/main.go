@@ -138,6 +138,9 @@ func run() error {
 	go func() { listenErr <- client.Listen(ctx) }()
 
 	if !*continuous {
+		// TODO: Modify the go client so this isn't needed
+		// Give us enough time to connect to SSE
+		time.Sleep(1 * time.Second)
 		candidateCmd := flag.Args()
 		if len(candidateCmd) == 0 {
 			return fmt.Errorf("usage: spec-tester [flags] -- candidate-command [args...]\n       or: spec-tester -continuous [flags]")
