@@ -22,6 +22,12 @@ import (
 	connect "github.com/trustleast/connect/goclient"
 )
 
+type trial struct {
+	PubKey string
+	Passed bool
+	Error  error
+}
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -52,7 +58,7 @@ func run() error {
 	defer cancel()
 
 	trace := newSignalTrace()
-	firstResult := make(chan error, 1) // single-run only
+	result := make(chan trial, 1) // single-run only
 
 	var client *connect.Client
 	opts := []connect.Option{
@@ -72,12 +78,10 @@ func run() error {
 					fmt.Fprintf(os.Stderr, "PASS %s\n", remotePubkey)
 				}
 
-				if !*continuous {
-					select {
-					case firstResult <- err:
-					default:
-					}
-					cancel()
+				result <- trial{
+					PubKey: remotePubkey,
+					Passed: err == nil,
+					Error:  err,
 				}
 			}()
 		}),
@@ -93,17 +97,34 @@ func run() error {
 	listenErr := make(chan error, 1)
 	go func() { listenErr <- client.Listen(ctx) }()
 
-	if *continuous {
-		return <-listenErr
-	}
-
 	// Single-run: launch the candidate and wait for one full validation.
+	go runCandidateCommand(ctx, *serverURL, client.Pubkey())
+
+	once := true
+	for once || *continuous {
+		once = false
+		select {
+		case err := <-listenErr:
+			fmt.Fprintf(os.Stderr, "Listening failed: %v", err)
+		case <-ctx.Done():
+			return nil
+		case trial := <-result:
+			if trial.Passed {
+				fmt.Fprintf(os.Stderr, "[PASSED] %s", trial.PubKey)
+			} else {
+				fmt.Fprintf(os.Stderr, "[FAILED] %s: %v", trial.PubKey, err)
+			}
+		}
+	}
+	return nil
+}
+
+func runCandidateCommand(ctx context.Context, serverURL string, pubkey string) error {
 	candidateCmd := flag.Args()
 	if len(candidateCmd) == 0 {
 		return fmt.Errorf("usage: spec-tester [flags] -- candidate-command [args...]\n       or: spec-tester -continuous [flags]")
 	}
-	candidateDone := make(chan error, 1)
-	candidateArgs := append(candidateCmd[1:], *serverURL, client.Pubkey())
+	candidateArgs := append(candidateCmd[1:], serverURL, pubkey)
 	fmt.Fprintf(os.Stderr, "starting candidate: %s %s\n", candidateCmd[0], strings.Join(candidateArgs, " "))
 	cmd := exec.CommandContext(ctx, candidateCmd[0], candidateArgs...)
 	cmd.Stdout = os.Stdout
@@ -111,34 +132,8 @@ func run() error {
 	if err := cmd.Start(); err != nil {
 		return fail("spec-tester.candidate.start", "start candidate: %v", err)
 	}
-	go func() { candidateDone <- cmd.Wait() }()
 
-	select {
-	case err := <-firstResult:
-		if err != nil {
-			return err
-		}
-	case err := <-listenErr:
-		return fail("spec-tester.listen", "listen failed: %v", err)
-	case err := <-candidateDone:
-		return fail("spec-tester.candidate.before-result", "candidate exited before validation completed: %v", err)
-	case <-ctx.Done():
-		return fail("spec-tester.timeout", "%v", ctx.Err())
-	}
-
-	select {
-	case err := <-candidateDone:
-		if err != nil {
-			return fail("spec-tester.candidate.exit", "candidate failed: %v", err)
-		}
-	case <-time.After(time.Second):
-		_ = cmd.Process.Kill()
-		return fail("spec-tester.candidate.exit", "candidate did not exit after dial-back passed")
-	case <-ctx.Done():
-		return fail("spec-tester.timeout", "%v", ctx.Err())
-	}
-
-	return nil
+	return cmd.Wait()
 }
 
 func handleIncoming(ctx context.Context, client *connect.Client, pc *webrtc.PeerConnection, remotePubkey string, trace *signalTrace, startIdx int, dialTimeout time.Duration) error {
