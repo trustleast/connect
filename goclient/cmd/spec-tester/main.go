@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -33,19 +34,20 @@ func run() error {
 	serverURL := flag.String("server-url", "", "connect relay URL")
 	timeout := flag.Duration("timeout", 30*time.Second, "overall spec timeout")
 	dialTimeout := flag.Duration("dial-timeout", 10*time.Second, "per-dial signaling timeout")
+	privateKeyFlag := flag.String("private-key", "", "base64url-encoded ed25519 private key (32-byte seed or 64-byte key); generates a new key if not set")
+	continuous := flag.Bool("continuous", false, "keep running and validate all incoming connections; candidate command is not used")
 	flag.Parse()
-
-	candidateCmd := flag.Args()
-	if len(candidateCmd) == 0 {
-		return fmt.Errorf("usage: spec-tester [flags] -- candidate-command [args...]")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
-	defer cancel()
 
 	trace := newSignalTrace()
 	inboundResult := make(chan inboundConnection, 1)
-	options := []connect.Option{
+
+	key, err := getPrivateKey(*privateKeyFlag)
+	if err != nil {
+		log.Fatal("Failed to get private key", err)
+	}
+
+	baseOpts := []connect.Option{
+		connect.WithPrivateKey(key),
 		connect.WithOnSignal(trace.observe),
 		connect.WithAcceptConnection(func(remotePubkey string) bool {
 			fmt.Fprintf(os.Stderr, "accepting inbound connection from %s\n", shortKey(remotePubkey))
@@ -70,13 +72,21 @@ func run() error {
 			})
 		}),
 	}
+	baseOpts = append(baseOpts, connect.WithServerURL(*serverURL))
 
-	if *serverURL != "" {
-		options = append(options, connect.WithServerURL(*serverURL))
+	if *continuous {
+		return runContinuous(context.Background(), baseOpts, *dialTimeout)
 	}
 
-	client, err := connect.New(options...)
+	candidateCmd := flag.Args()
+	if len(candidateCmd) == 0 {
+		return fmt.Errorf("usage: spec-tester [flags] -- candidate-command [args...]")
+	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+
+	client, err := connect.New(baseOpts...)
 	if err != nil {
 		return fail("spec-tester.client.create", "create spec client: %v", err)
 	}
@@ -119,16 +129,17 @@ func run() error {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "validating inbound-leg signaling invariants\n")
-	if err := trace.validateInboundAnswerer(client.Pubkey(), inbound.remotePubkey); err != nil {
+	if err := trace.validateInboundAnswerer(0, client.Pubkey(), inbound.remotePubkey); err != nil {
 		return err
 	}
 
 	fmt.Fprintf(os.Stderr, "dialing candidate back\n")
+	dialStartIdx := trace.len()
 	if err := dialBack(ctx, client, inbound.remotePubkey, *dialTimeout); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "validating outbound-leg signaling invariants\n")
-	if err := trace.validateOutboundDialer(client.Pubkey(), inbound.remotePubkey); err != nil {
+	if err := trace.validateOutboundDialer(dialStartIdx, client.Pubkey(), inbound.remotePubkey); err != nil {
 		return err
 	}
 
@@ -146,6 +157,70 @@ func run() error {
 	}
 
 	return nil
+}
+
+func runContinuous(ctx context.Context, baseOpts []connect.Option, dialTimeout time.Duration) error {
+	trace := newSignalTrace()
+
+	var client *connect.Client
+	var err error
+	client, err = connect.New(append(baseOpts,
+		connect.WithOnSignal(trace.observe),
+		connect.WithAcceptConnection(func(remotePubkey string) bool {
+			return true
+		}),
+		connect.WithOnIncoming(func(pc *webrtc.PeerConnection, remotePubkey string) {
+			startIdx := trace.len()
+			go handleContinuousIncoming(ctx, client, pc, remotePubkey, trace, startIdx, dialTimeout)
+		}),
+	)...)
+	if err != nil {
+		return fmt.Errorf("create spec client: %w", err)
+	}
+	defer client.Close()
+	fmt.Fprintf(os.Stderr, "spec-tester listening pubkey=%s\n", client.Pubkey())
+
+	return client.Listen(ctx)
+}
+
+func handleContinuousIncoming(ctx context.Context, client *connect.Client, pc *webrtc.PeerConnection, remotePubkey string, trace *signalTrace, startIdx int, dialTimeout time.Duration) {
+	fmt.Fprintf(os.Stderr, "inbound offer accepted from %s\n", shortKey(remotePubkey))
+
+	done := make(chan error, 1)
+	label := uuid.New().String()
+	pc.OnConnectionStateChange(func(pcs webrtc.PeerConnectionState) {
+		if pcs == webrtc.PeerConnectionStateConnected {
+			dc, err := pc.CreateDataChannel(label, nil)
+			if err != nil {
+				done <- fail("connection-flow.inbound.datachannel.create", "create data channel: %v", err)
+			} else {
+				wireChallenge(dc, done)
+			}
+		}
+	})
+
+	if err := waitResult(ctx, done, "connection-flow.inbound.challenge-pong"); err != nil {
+		fmt.Fprintf(os.Stderr, "FAIL %s: %v\n", shortKey(remotePubkey), err)
+		return
+	}
+	if err := trace.validateInboundAnswerer(startIdx, client.Pubkey(), remotePubkey); err != nil {
+		fmt.Fprintf(os.Stderr, "FAIL %s: %v\n", shortKey(remotePubkey), err)
+		return
+	}
+
+	dialCtx, dialCancel := context.WithTimeout(ctx, dialTimeout)
+	defer dialCancel()
+	dialStartIdx := trace.len()
+	if err := dialBack(dialCtx, client, remotePubkey, dialTimeout); err != nil {
+		fmt.Fprintf(os.Stderr, "FAIL %s: %v\n", shortKey(remotePubkey), err)
+		return
+	}
+	if err := trace.validateOutboundDialer(dialStartIdx, client.Pubkey(), remotePubkey); err != nil {
+		fmt.Fprintf(os.Stderr, "FAIL %s: %v\n", shortKey(remotePubkey), err)
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "PASS %s\n", shortKey(remotePubkey))
 }
 
 type inboundConnection struct {
@@ -192,16 +267,23 @@ func (t *signalTrace) observe(event connect.SignalEvent) {
 	t.mu.Unlock()
 }
 
-func (t *signalTrace) snapshot() []observedSignal {
+func (t *signalTrace) len() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	out := make([]observedSignal, len(t.events))
-	copy(out, t.events)
+	return len(t.events)
+}
+
+func (t *signalTrace) snapshot(fromIdx int) []observedSignal {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	src := t.events[fromIdx:]
+	out := make([]observedSignal, len(src))
+	copy(out, src)
 	return out
 }
 
-func (t *signalTrace) validateInboundAnswerer(selfPubkey, remotePubkey string) error {
-	events := t.snapshot()
+func (t *signalTrace) validateInboundAnswerer(fromIdx int, selfPubkey, remotePubkey string) error {
+	events := t.snapshot(fromIdx)
 	var offer *wireMessage
 	var answerSeen bool
 	for i := range events {
@@ -252,8 +334,8 @@ func (t *signalTrace) validateInboundAnswerer(selfPubkey, remotePubkey string) e
 	return nil
 }
 
-func (t *signalTrace) validateOutboundDialer(selfPubkey, remotePubkey string) error {
-	events := t.snapshot()
+func (t *signalTrace) validateOutboundDialer(fromIdx int, selfPubkey, remotePubkey string) error {
+	events := t.snapshot(fromIdx)
 	var offer *wireMessage
 	var answerSeen bool
 	for i := range events {
@@ -539,4 +621,24 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func getPrivateKey(keyData string) (ed25519.PrivateKey, error) {
+	if keyData != "" {
+		keyBytes, err := base64.RawURLEncoding.DecodeString(keyData)
+		if err != nil {
+			return nil, fmt.Errorf("decoding -private-key: %w", err)
+		}
+		switch len(keyBytes) {
+		case ed25519.SeedSize:
+			return ed25519.NewKeyFromSeed(keyBytes), nil
+		case ed25519.PrivateKeySize:
+			return ed25519.PrivateKey(keyBytes), nil
+		default:
+			return nil, fmt.Errorf("-private-key must be 32 bytes (seed) or 64 bytes, got %d", len(keyBytes))
+		}
+	}
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	return priv, err
 }

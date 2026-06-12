@@ -1,7 +1,6 @@
 go 1.25.0
 
 use (
-	./connect-http-bridge
 	./goclient
 	./signaling
 	./signaling/cmd/server
