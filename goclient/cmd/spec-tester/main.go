@@ -22,10 +22,61 @@ import (
 	connect "github.com/trustleast/connect/goclient"
 )
 
+type check struct {
+	Name string
+	Err  error
+}
+
+func (c check) passed() bool { return c.Err == nil }
+
 type trial struct {
-	PubKey string
-	Passed bool
-	Error  error
+	PubKey   string
+	Checks   []check
+	TimedOut bool
+}
+
+func (t *trial) record(name string, err error) {
+	t.Checks = append(t.Checks, check{name, err})
+}
+
+func (t trial) passed() bool {
+	if len(t.Checks) == 0 {
+		return false
+	}
+	for _, c := range t.Checks {
+		if !c.passed() {
+			return false
+		}
+	}
+	return true
+}
+
+func (t trial) firstErr() error {
+	for _, c := range t.Checks {
+		if c.Err != nil {
+			return c.Err
+		}
+	}
+	return nil
+}
+
+func printTrial(t trial) {
+	fmt.Fprintf(os.Stderr, "--- TRIAL %s ---\n", t.PubKey)
+	for _, c := range t.Checks {
+		if c.passed() {
+			fmt.Fprintf(os.Stderr, "  [PASS] %s\n", c.Name)
+		} else {
+			fmt.Fprintf(os.Stderr, "  [FAIL] %s: %v\n", c.Name, c.Err)
+		}
+	}
+	switch {
+	case t.passed():
+		fmt.Fprintf(os.Stderr, "  RESULT: PASS\n")
+	case t.TimedOut:
+		fmt.Fprintf(os.Stderr, "  RESULT: FAIL (timed out)\n")
+	default:
+		fmt.Fprintf(os.Stderr, "  RESULT: FAIL\n")
+	}
 }
 
 func main() {
@@ -37,7 +88,7 @@ func main() {
 
 func run() error {
 	serverURL := flag.String("server-url", "", "connect relay URL")
-	timeout := flag.Duration("timeout", 30*time.Second, "overall spec timeout (single-run only)")
+	trialTimeout := flag.Duration("timeout", 30*time.Second, "per-trial timeout")
 	dialTimeout := flag.Duration("dial-timeout", 10*time.Second, "per-dial signaling timeout")
 	privateKeyFlag := flag.String("private-key", "", "base64url-encoded ed25519 private key (32-byte seed or 64-byte key); generates a new key if not set")
 	continuous := flag.Bool("continuous", false, "keep running and validate all incoming connections; candidate command is not used")
@@ -53,15 +104,15 @@ func run() error {
 	if *continuous {
 		ctx, cancel = context.WithCancel(context.Background())
 	} else {
-		ctx, cancel = context.WithTimeout(context.Background(), *timeout)
+		ctx, cancel = context.WithTimeout(context.Background(), *trialTimeout)
 	}
 	defer cancel()
 
 	trace := newSignalTrace()
-	result := make(chan trial, 1) // single-run only
+	results := make(chan trial, 64)
 
 	var client *connect.Client
-	opts := []connect.Option{
+	client, err = connect.New(
 		connect.WithServerURL(*serverURL),
 		connect.WithPrivateKey(key),
 		connect.WithOnSignal(trace.observe),
@@ -70,24 +121,13 @@ func run() error {
 			// OnSignal fires before OnIncoming, so the offer is already the last
 			// event in the trace. Subtract 1 to include it in validation.
 			startIdx := trace.len() - 1
+			trialCtx, trialCancel := context.WithTimeout(ctx, *trialTimeout)
 			go func() {
-				err := handleIncoming(ctx, client, pc, remotePubkey, trace, startIdx, *dialTimeout)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "FAIL %s: %v\n", remotePubkey, err)
-				} else {
-					fmt.Fprintf(os.Stderr, "PASS %s\n", remotePubkey)
-				}
-
-				result <- trial{
-					PubKey: remotePubkey,
-					Passed: err == nil,
-					Error:  err,
-				}
+				defer trialCancel()
+				results <- handleIncoming(trialCtx, client, pc, remotePubkey, trace, startIdx, *dialTimeout)
 			}()
 		}),
-	}
-
-	client, err = connect.New(opts...)
+	)
 	if err != nil {
 		return fmt.Errorf("create spec client: %w", err)
 	}
@@ -97,22 +137,26 @@ func run() error {
 	listenErr := make(chan error, 1)
 	go func() { listenErr <- client.Listen(ctx) }()
 
-	// Single-run: launch the candidate and wait for one full validation.
-	go runCandidateCommand(ctx, *serverURL, client.Pubkey())
+	if !*continuous {
+		candidateCmd := flag.Args()
+		if len(candidateCmd) == 0 {
+			return fmt.Errorf("usage: spec-tester [flags] -- candidate-command [args...]\n       or: spec-tester -continuous [flags]")
+		}
+		go runCandidateCommand(ctx, *serverURL, client.Pubkey())
+	}
 
 	once := true
 	for once || *continuous {
 		once = false
 		select {
 		case err := <-listenErr:
-			fmt.Fprintf(os.Stderr, "Listening failed: %v", err)
+			return fmt.Errorf("listen failed: %w", err)
 		case <-ctx.Done():
 			return nil
-		case trial := <-result:
-			if trial.Passed {
-				fmt.Fprintf(os.Stderr, "[PASSED] %s", trial.PubKey)
-			} else {
-				fmt.Fprintf(os.Stderr, "[FAILED] %s: %v", trial.PubKey, err)
+		case t := <-results:
+			printTrial(t)
+			if !*continuous {
+				return t.firstErr()
 			}
 		}
 	}
@@ -122,7 +166,7 @@ func run() error {
 func runCandidateCommand(ctx context.Context, serverURL string, pubkey string) error {
 	candidateCmd := flag.Args()
 	if len(candidateCmd) == 0 {
-		return fmt.Errorf("usage: spec-tester [flags] -- candidate-command [args...]\n       or: spec-tester -continuous [flags]")
+		return nil
 	}
 	candidateArgs := append(candidateCmd[1:], serverURL, pubkey)
 	fmt.Fprintf(os.Stderr, "starting candidate: %s %s\n", candidateCmd[0], strings.Join(candidateArgs, " "))
@@ -132,13 +176,14 @@ func runCandidateCommand(ctx context.Context, serverURL string, pubkey string) e
 	if err := cmd.Start(); err != nil {
 		return fail("spec-tester.candidate.start", "start candidate: %v", err)
 	}
-
 	return cmd.Wait()
 }
 
-func handleIncoming(ctx context.Context, client *connect.Client, pc *webrtc.PeerConnection, remotePubkey string, trace *signalTrace, startIdx int, dialTimeout time.Duration) error {
+func handleIncoming(ctx context.Context, client *connect.Client, pc *webrtc.PeerConnection, remotePubkey string, trace *signalTrace, startIdx int, dialTimeout time.Duration) trial {
+	t := trial{PubKey: remotePubkey}
 	fmt.Fprintf(os.Stderr, "inbound offer accepted from %s\n", remotePubkey)
 
+	// inbound.pong: wait for the peer connection, open a data channel, challenge/response.
 	done := make(chan error, 1)
 	label := uuid.New().String()
 	pc.OnConnectionStateChange(func(pcs webrtc.PeerConnectionState) {
@@ -152,29 +197,58 @@ func handleIncoming(ctx context.Context, client *connect.Client, pc *webrtc.Peer
 			}
 		}
 	})
-
-	fmt.Fprintf(os.Stderr, "waiting for inbound-leg challenge/pong\n")
-	if err := waitResult(ctx, done, "connection-flow.inbound.challenge-pong"); err != nil {
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "validating inbound-leg signaling invariants\n")
-	if err := trace.validateInboundAnswerer(startIdx, client.Pubkey(), remotePubkey); err != nil {
-		return err
+	err := waitResult(ctx, done, "inbound.pong")
+	t.record("inbound.pong", err)
+	if err != nil {
+		t.TimedOut = ctx.Err() != nil
+		return t
 	}
 
-	fmt.Fprintf(os.Stderr, "dialing candidate back\n")
+	// inbound.signaling: validate offer/answer/ICE signatures and ordering.
+	t.record("inbound.signaling", trace.validateInboundAnswerer(startIdx, client.Pubkey(), remotePubkey))
+	if !t.Checks[len(t.Checks)-1].passed() {
+		return t
+	}
+
+	// outbound.dial: dial back and wait for signaling auth to complete.
 	dialCtx, dialCancel := context.WithTimeout(ctx, dialTimeout)
 	defer dialCancel()
 	dialStartIdx := trace.len()
-	if err := dialBack(dialCtx, client, remotePubkey, dialTimeout); err != nil {
-		return err
+
+	outboundDone := make(chan error, 1)
+	outPC, err := client.Dial(dialCtx, remotePubkey, func(pc *webrtc.PeerConnection) {
+		lbl, err := randomChannelLabel()
+		if err != nil {
+			outboundDone <- err
+			return
+		}
+		fmt.Fprintf(os.Stderr, "creating outbound data channel label=%s\n", lbl)
+		dc, err := pc.CreateDataChannel(lbl, nil)
+		if err != nil {
+			outboundDone <- fail("connection-flow.outbound.datachannel.create", "create data channel: %v", err)
+			return
+		}
+		wireChallenge(dc, outboundDone)
+	})
+	t.record("outbound.dial", err)
+	if err != nil {
+		t.TimedOut = dialCtx.Err() != nil || ctx.Err() != nil
+		return t
 	}
-	fmt.Fprintf(os.Stderr, "validating outbound-leg signaling invariants\n")
-	if err := trace.validateOutboundDialer(dialStartIdx, client.Pubkey(), remotePubkey); err != nil {
-		return err
+	defer outPC.Close()
+
+	// outbound.pong: wait for challenge/response on the dial-back connection.
+	err = waitResult(dialCtx, outboundDone, "outbound.pong")
+	t.record("outbound.pong", err)
+	if err != nil {
+		t.TimedOut = dialCtx.Err() != nil || ctx.Err() != nil
+		return t
 	}
 
-	return nil
+	// outbound.signaling: validate offer/answer/ICE signatures and ordering.
+	t.record("outbound.signaling", trace.validateOutboundDialer(dialStartIdx, client.Pubkey(), remotePubkey))
+
+	return t
 }
 
 type wireMessage struct {
@@ -472,33 +546,6 @@ func senderAndSig(msg wireMessage) (ed25519.PublicKey, []byte, error) {
 		return nil, nil, fail("wire.signature", "signature was not valid base64url ed25519 signature")
 	}
 	return ed25519.PublicKey(sender), sig, nil
-}
-
-func dialBack(ctx context.Context, client *connect.Client, remotePubkey string, timeout time.Duration) error {
-	dialCtx, dialCancel := context.WithTimeout(ctx, timeout)
-	defer dialCancel()
-	done := make(chan error, 1)
-	pc, err := client.Dial(dialCtx, remotePubkey, func(pc *webrtc.PeerConnection) {
-		label, err := randomChannelLabel()
-		if err != nil {
-			done <- err
-			return
-		}
-		fmt.Fprintf(os.Stderr, "creating outbound-leg tester data channel label=%s\n", label)
-		dc, err := pc.CreateDataChannel(label, nil)
-		if err != nil {
-			done <- fail("connection-flow.outbound.datachannel.create", "create data channel: %v", err)
-			return
-		}
-		wireChallenge(dc, done)
-	})
-	if err != nil {
-		return fail("connection-flow.outbound.signaling-auth", "dial back signaling/auth failed: %v", err)
-	}
-	defer pc.Close()
-
-	fmt.Fprintf(os.Stderr, "waiting for outbound-leg challenge/pong\n")
-	return waitResult(ctx, done, "connection-flow.outbound.challenge-pong")
 }
 
 func wireChallenge(dc *webrtc.DataChannel, done chan<- error) {
