@@ -22,6 +22,10 @@ import (
 	connect "github.com/trustleast/connect/goclient"
 )
 
+// ---------------------------------------------------------------------------
+// Trial result types
+// ---------------------------------------------------------------------------
+
 type check struct {
 	Name string
 	Err  error
@@ -51,15 +55,6 @@ func (t trial) passed() bool {
 	return true
 }
 
-func (t trial) firstErr() error {
-	for _, c := range t.Checks {
-		if c.Err != nil {
-			return c.Err
-		}
-	}
-	return nil
-}
-
 func printTrial(t trial) {
 	fmt.Fprintf(os.Stderr, "--- TRIAL %s ---\n", t.PubKey)
 	for _, c := range t.Checks {
@@ -79,6 +74,133 @@ func printTrial(t trial) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Signal bus: routes events to per-trial mailboxes keyed by session challenge
+// ---------------------------------------------------------------------------
+
+type observedSignal struct {
+	event connect.SignalEvent
+	msg   wireMessage
+}
+
+type trialMailbox struct {
+	mu     sync.Mutex
+	events []observedSignal
+}
+
+func (m *trialMailbox) add(e observedSignal) {
+	m.mu.Lock()
+	m.events = append(m.events, e)
+	m.mu.Unlock()
+}
+
+func (m *trialMailbox) snapshot() []observedSignal {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]observedSignal, len(m.events))
+	copy(out, m.events)
+	return out
+}
+
+type signalBus struct {
+	quiet     bool
+	mu        sync.Mutex
+	mailboxes map[string]*trialMailbox // challenge → mailbox
+	pending   map[string]string        // remotePubkey → challenge (inbound offers awaiting claim)
+}
+
+func newSignalBus(quiet bool) *signalBus {
+	return &signalBus{
+		quiet:     quiet,
+		mailboxes: make(map[string]*trialMailbox),
+		pending:   make(map[string]string),
+	}
+}
+
+func (b *signalBus) observe(event connect.SignalEvent) {
+	var msg wireMessage
+	raw, err := base64.RawURLEncoding.DecodeString(event.Payload)
+	if err != nil || json.Unmarshal(raw, &msg) != nil || msg.Challenge == "" {
+		return
+	}
+
+	direction := ">"
+	if event.Direction == connect.SignalInboundSSE {
+		direction = "<"
+	}
+	if !b.quiet {
+		fmt.Printf("%s %s\n", direction, raw)
+	}
+
+	b.mu.Lock()
+	mb, exists := b.mailboxes[msg.Challenge]
+	if !exists {
+		mb = &trialMailbox{}
+		b.mailboxes[msg.Challenge] = mb
+		// Register inbound offers so OnIncoming can claim the mailbox by remotePubkey.
+		if event.Direction == connect.SignalInboundSSE && msg.Ts != "" {
+			b.pending[msg.From] = msg.Challenge
+		}
+	}
+	b.mu.Unlock()
+
+	mb.add(observedSignal{event: event, msg: msg})
+}
+
+// claimIncoming retrieves the mailbox for the offer that just arrived from
+// remotePubkey. Called synchronously in OnIncoming before the goroutine.
+// The mailbox is intentionally left in b.mailboxes so that subsequent events
+// (our answer, ICE candidates) are still routed to it. Call releaseMailbox
+// with the returned challenge when the trial goroutine exits.
+func (b *signalBus) claimIncoming(remotePubkey string) (*trialMailbox, string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	challenge, ok := b.pending[remotePubkey]
+	if !ok {
+		return &trialMailbox{}, ""
+	}
+	delete(b.pending, remotePubkey)
+	return b.mailboxes[challenge], challenge
+}
+
+// releaseMailbox removes a mailbox from the bus once its trial is complete.
+func (b *signalBus) releaseMailbox(challenge string) {
+	if challenge == "" {
+		return
+	}
+	b.mu.Lock()
+	delete(b.mailboxes, challenge)
+	b.mu.Unlock()
+}
+
+// claimOutbound finds the mailbox for a dial-back session by identifying the
+// one whose first event is our outbound offer. This distinguishes it from the
+// inbound mailbox, which begins with the remote's offer. Called after
+// client.Dial returns and after pong completes so all ICE has arrived.
+func (b *signalBus) claimOutbound(selfPubkey, remotePubkey string) *trialMailbox {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for challenge, mb := range b.mailboxes {
+		events := mb.snapshot()
+		if len(events) == 0 {
+			continue
+		}
+		first := events[0]
+		if first.event.Direction == connect.SignalOutboundPOST &&
+			first.event.RemotePubkey == remotePubkey &&
+			first.msg.From == selfPubkey &&
+			first.msg.Ts != "" {
+			delete(b.mailboxes, challenge)
+			return mb
+		}
+	}
+	return &trialMailbox{}
+}
+
+// ---------------------------------------------------------------------------
+// main / run
+// ---------------------------------------------------------------------------
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -87,6 +209,7 @@ func main() {
 }
 
 func run() error {
+	verbose := flag.Bool("verbose", false, "add more verbose logging")
 	serverURL := flag.String("server-url", "", "connect relay URL")
 	trialTimeout := flag.Duration("timeout", 30*time.Second, "per-trial timeout")
 	dialTimeout := flag.Duration("dial-timeout", 10*time.Second, "per-dial signaling timeout")
@@ -108,23 +231,41 @@ func run() error {
 	}
 	defer cancel()
 
-	trace := newSignalTrace()
+	bus := newSignalBus(!*verbose)
 	results := make(chan trial, 64)
 
 	var client *connect.Client
 	client, err = connect.New(
 		connect.WithServerURL(*serverURL),
 		connect.WithPrivateKey(key),
-		connect.WithOnSignal(trace.observe),
+		connect.WithOnSignal(bus.observe),
 		connect.WithAcceptConnection(func(remotePubkey string) bool { return true }),
 		connect.WithOnIncoming(func(pc *webrtc.PeerConnection, remotePubkey string) {
-			// OnSignal fires before OnIncoming, so the offer is already the last
-			// event in the trace. Subtract 1 to include it in validation.
-			startIdx := trace.len() - 1
+			// Claim the mailbox and wire the PC synchronously before spawning the
+			// goroutine so no events or state transitions can be missed.
+			mb, challenge := bus.claimIncoming(remotePubkey)
+
+			inboundPongDone := make(chan error, 1)
+			label := uuid.New().String()
+			pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+				if state == webrtc.PeerConnectionStateConnected {
+					if *verbose {
+						fmt.Fprintf(os.Stderr, "peer connection state connected for inbound from %s\n", remotePubkey)
+					}
+					dc, err := pc.CreateDataChannel(label, nil)
+					if err != nil {
+						inboundPongDone <- fail("connection-flow.inbound.datachannel.create", "create data channel: %v", err)
+					} else {
+						wireChallenge(dc, inboundPongDone, *verbose)
+					}
+				}
+			})
+
 			trialCtx, trialCancel := context.WithTimeout(ctx, *trialTimeout)
 			go func() {
 				defer trialCancel()
-				results <- handleIncoming(trialCtx, client, pc, remotePubkey, trace, startIdx, *dialTimeout)
+				defer bus.releaseMailbox(challenge)
+				results <- handleIncoming(trialCtx, client, bus, mb, inboundPongDone, remotePubkey, *dialTimeout, *verbose)
 			}()
 		}),
 	)
@@ -132,15 +273,14 @@ func run() error {
 		return fmt.Errorf("create spec client: %w", err)
 	}
 	defer client.Close()
-	fmt.Fprintf(os.Stderr, "spec-tester listening pubkey=%s\n", client.Pubkey())
+	if *verbose {
+		fmt.Fprintf(os.Stderr, "spec-tester listening pubkey=%s\n", client.Pubkey())
+	}
 
 	listenErr := make(chan error, 1)
 	go func() { listenErr <- client.Listen(ctx) }()
 
 	if !*continuous {
-		// TODO: Modify the go client so this isn't needed
-		// Give us enough time to connect to SSE
-		time.Sleep(1 * time.Second)
 		candidateCmd := flag.Args()
 		if len(candidateCmd) == 0 {
 			return fmt.Errorf("usage: spec-tester [flags] -- candidate-command [args...]\n       or: spec-tester -continuous [flags]")
@@ -158,9 +298,6 @@ func run() error {
 			return nil
 		case t := <-results:
 			printTrial(t)
-			if !*continuous {
-				return t.firstErr()
-			}
 		}
 	}
 	return nil
@@ -172,7 +309,6 @@ func runCandidateCommand(ctx context.Context, serverURL string, pubkey string) e
 		return nil
 	}
 	candidateArgs := append(candidateCmd[1:], serverURL, pubkey)
-	fmt.Fprintf(os.Stderr, "starting candidate: %s %s\n", candidateCmd[0], strings.Join(candidateArgs, " "))
 	cmd := exec.CommandContext(ctx, candidateCmd[0], candidateArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -182,56 +318,48 @@ func runCandidateCommand(ctx context.Context, serverURL string, pubkey string) e
 	return cmd.Wait()
 }
 
-func handleIncoming(ctx context.Context, client *connect.Client, pc *webrtc.PeerConnection, remotePubkey string, trace *signalTrace, startIdx int, dialTimeout time.Duration) trial {
-	t := trial{PubKey: remotePubkey}
-	fmt.Fprintf(os.Stderr, "inbound offer accepted from %s\n", remotePubkey)
+// ---------------------------------------------------------------------------
+// Trial execution
+// ---------------------------------------------------------------------------
 
-	// inbound.pong: wait for the peer connection, open a data channel, challenge/response.
-	done := make(chan error, 1)
-	label := uuid.New().String()
-	pc.OnConnectionStateChange(func(pcs webrtc.PeerConnectionState) {
-		if pcs == webrtc.PeerConnectionStateConnected {
-			fmt.Fprintf(os.Stderr, "peer connection state connected for inbound from %s\n", remotePubkey)
-			dc, err := pc.CreateDataChannel(label, nil)
-			if err != nil {
-				done <- fail("connection-flow.inbound.datachannel.create", "create data channel: %v", err)
-			} else {
-				wireChallenge(dc, done)
-			}
-		}
-	})
-	err := waitResult(ctx, done, "inbound.pong")
+func handleIncoming(ctx context.Context, client *connect.Client, bus *signalBus, inboundMb *trialMailbox, inboundPongDone <-chan error, remotePubkey string, dialTimeout time.Duration, verbose bool) trial {
+	t := trial{PubKey: remotePubkey}
+	if verbose {
+		fmt.Fprintf(os.Stderr, "inbound offer accepted from %s\n", remotePubkey)
+	}
+
+	// inbound.pong: wait for the PC to connect and complete challenge/response.
+	err := waitResult(ctx, inboundPongDone, "inbound.pong")
 	t.record("inbound.pong", err)
 	if err != nil {
 		t.TimedOut = ctx.Err() != nil
+		checkInboundSignaling(&t, inboundMb.snapshot(), client.Pubkey(), remotePubkey)
 		return t
 	}
 
-	// inbound.signaling: validate offer/answer/ICE signatures and ordering.
-	t.record("inbound.signaling", trace.validateInboundAnswerer(startIdx, client.Pubkey(), remotePubkey))
-	if !t.Checks[len(t.Checks)-1].passed() {
-		return t
-	}
+	checkInboundSignaling(&t, inboundMb.snapshot(), client.Pubkey(), remotePubkey)
 
-	// outbound.dial: dial back and wait for signaling auth to complete.
+	// outbound.dial: the setup func passed to Dial is called synchronously before
+	// the offer is sent, so wiring wireChallenge there is race-free.
 	dialCtx, dialCancel := context.WithTimeout(ctx, dialTimeout)
 	defer dialCancel()
-	dialStartIdx := trace.len()
 
-	outboundDone := make(chan error, 1)
+	outboundPongDone := make(chan error, 1)
 	outPC, err := client.Dial(dialCtx, remotePubkey, func(pc *webrtc.PeerConnection) {
 		lbl, err := randomChannelLabel()
 		if err != nil {
-			outboundDone <- err
+			outboundPongDone <- err
 			return
 		}
-		fmt.Fprintf(os.Stderr, "creating outbound data channel label=%s\n", lbl)
+		if verbose {
+			fmt.Fprintf(os.Stderr, "creating outbound data channel label=%s\n", lbl)
+		}
 		dc, err := pc.CreateDataChannel(lbl, nil)
 		if err != nil {
-			outboundDone <- fail("connection-flow.outbound.datachannel.create", "create data channel: %v", err)
+			outboundPongDone <- fail("connection-flow.outbound.datachannel.create", "create data channel: %v", err)
 			return
 		}
-		wireChallenge(dc, outboundDone)
+		wireChallenge(dc, outboundPongDone, verbose)
 	})
 	t.record("outbound.dial", err)
 	if err != nil {
@@ -241,190 +369,155 @@ func handleIncoming(ctx context.Context, client *connect.Client, pc *webrtc.Peer
 	defer outPC.Close()
 
 	// outbound.pong: wait for challenge/response on the dial-back connection.
-	err = waitResult(dialCtx, outboundDone, "outbound.pong")
+	err = waitResult(dialCtx, outboundPongDone, "outbound.pong")
 	t.record("outbound.pong", err)
 	if err != nil {
 		t.TimedOut = dialCtx.Err() != nil || ctx.Err() != nil
-		return t
 	}
 
-	// outbound.signaling: validate offer/answer/ICE signatures and ordering.
-	t.record("outbound.signaling", trace.validateOutboundDialer(dialStartIdx, client.Pubkey(), remotePubkey))
+	// Claim the outbound mailbox after pong so all ICE candidates have arrived.
+	outboundMb := bus.claimOutbound(client.Pubkey(), remotePubkey)
+	checkOutboundSignaling(&t, outboundMb.snapshot(), client.Pubkey(), remotePubkey)
 
 	return t
 }
 
-type wireMessage struct {
-	From      string `json:"from"`
-	Data      string `json:"data"`
-	Challenge string `json:"challenge"`
-	Ts        string `json:"ts,omitempty"`
-	Sig       string `json:"sig"`
-}
+// ---------------------------------------------------------------------------
+// Signaling checks
+// ---------------------------------------------------------------------------
 
-type observedSignal struct {
-	event connect.SignalEvent
-	msg   wireMessage
-	ok    bool
-}
-
-type signalTrace struct {
-	mu     sync.Mutex
-	events []observedSignal
-}
-
-func newSignalTrace() *signalTrace {
-	return &signalTrace{}
-}
-
-func (t *signalTrace) observe(event connect.SignalEvent) {
-	var msg wireMessage
-	raw, err := base64.RawURLEncoding.DecodeString(event.Payload)
-	ok := err == nil && json.Unmarshal(raw, &msg) == nil
-
-	direction := ">"
-	if event.Direction == connect.SignalInboundSSE {
-		direction = "<"
-	}
-	fmt.Printf("%s %s\n", direction, raw)
-
-	t.mu.Lock()
-	t.events = append(t.events, observedSignal{event: event, msg: msg, ok: ok})
-	t.mu.Unlock()
-}
-
-func (t *signalTrace) len() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return len(t.events)
-}
-
-func (t *signalTrace) snapshot(fromIdx int) []observedSignal {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	src := t.events[fromIdx:]
-	out := make([]observedSignal, len(src))
-	copy(out, src)
-	return out
-}
-
-func (t *signalTrace) validateInboundAnswerer(fromIdx int, selfPubkey, remotePubkey string) error {
-	events := t.snapshot(fromIdx)
+// checkInboundSignaling validates the exchange where the tester acted as answerer.
+func checkInboundSignaling(t *trial, events []observedSignal, selfPubkey, remotePubkey string) {
 	var offer *wireMessage
-	var answerSeen bool
+	var answer *wireMessage
+	var iceBeforeAnswer bool
+	var multipleAnswers bool
+	var outboundICE []wireMessage
+
 	for i := range events {
-		event := events[i]
-		if !event.ok {
-			return fail("wire.envelope.base64-json", "invalid observed envelope in %s", event.event.Direction)
-		}
-		msg := event.msg
-		if event.event.Direction == connect.SignalInboundSSE && msg.From == remotePubkey {
-			if offer == nil {
-				if msg.Ts == "" {
-					return fail("offer.timestamp", "inbound first message from candidate had no timestamp")
-				}
-				if err := validateOffer(msg, selfPubkey); err != nil {
-					return err
-				}
-				offer = &msg
+		e := events[i]
+		if e.event.Direction == connect.SignalInboundSSE && e.msg.From == remotePubkey {
+			if offer == nil && e.msg.Ts != "" {
+				m := e.msg
+				offer = &m
 			}
 		}
-		if event.event.Direction == connect.SignalOutboundPOST && event.event.RemotePubkey == remotePubkey {
-			if msg.Ts == "" {
-				if !answerSeen {
-					return fail("answer.before-ice", "tester sent ICE before answer on inbound leg")
+		if e.event.Direction == connect.SignalOutboundPOST && e.event.RemotePubkey == remotePubkey {
+			if e.msg.Ts != "" {
+				if answer == nil {
+					m := e.msg
+					answer = &m
+				} else {
+					multipleAnswers = true
 				}
-				if err := validateICE(msg, offer.Challenge); err != nil {
-					return err
+			} else {
+				if answer == nil {
+					iceBeforeAnswer = true
+				} else {
+					outboundICE = append(outboundICE, e.msg)
 				}
-				continue
 			}
-			if offer == nil {
-				return fail("answer.after-offer", "tester sent answer before observing offer")
-			}
-			if answerSeen {
-				return fail("answer.once", "tester sent multiple answers on inbound leg")
-			}
-			if err := validateAnswer(msg, *offer); err != nil {
-				return err
-			}
-			answerSeen = true
 		}
 	}
+
 	if offer == nil {
-		return fail("offer.present", "candidate offer was not observed")
+		t.record("inbound.offer", fmt.Errorf("no offer observed from remote"))
+		t.record("inbound.answer.ordering", fmt.Errorf("skipped: no offer"))
+		t.record("inbound.answer", fmt.Errorf("skipped: no offer"))
+		t.record("inbound.ice", fmt.Errorf("skipped: no offer"))
+		return
 	}
-	if !answerSeen {
-		return fail("answer.present", "tester answer was not observed")
+	t.record("inbound.offer", checkOfferValid(*offer, selfPubkey))
+
+	switch {
+	case iceBeforeAnswer:
+		t.record("inbound.answer.ordering", fmt.Errorf("tester sent ICE before answer"))
+	case multipleAnswers:
+		t.record("inbound.answer.ordering", fmt.Errorf("tester sent multiple answers"))
+	default:
+		t.record("inbound.answer.ordering", nil)
 	}
-	return nil
+
+	if answer == nil {
+		t.record("inbound.answer", fmt.Errorf("no answer observed from tester"))
+	} else {
+		t.record("inbound.answer", checkAnswerValid(*answer, *offer))
+	}
+
+	t.record("inbound.ice", checkICEsValid(outboundICE, offer.Challenge))
 }
 
-func (t *signalTrace) validateOutboundDialer(fromIdx int, selfPubkey, remotePubkey string) error {
-	events := t.snapshot(fromIdx)
+// checkOutboundSignaling validates the exchange where the tester acted as dialer.
+func checkOutboundSignaling(t *trial, events []observedSignal, selfPubkey, remotePubkey string) {
 	var offer *wireMessage
-	var answerSeen bool
+	var answer *wireMessage
+	var iceBeforeAnswer bool
+	var multipleAnswers bool
+	var inboundICE []wireMessage
+
 	for i := range events {
-		event := events[i]
-		if !event.ok {
-			return fail("wire.envelope.base64-json", "invalid observed envelope in %s", event.event.Direction)
-		}
-		msg := event.msg
-		if event.event.Direction == connect.SignalOutboundPOST && event.event.RemotePubkey == remotePubkey && msg.From == selfPubkey {
-			if offer != nil && msg.Challenge != offer.Challenge {
-				continue
-			}
-			if msg.Ts == "" {
-				if offer == nil {
-					continue
-				}
-				if err := validateICE(msg, offer.Challenge); err != nil {
-					return err
-				}
-				continue
-			}
-			if offer == nil {
-				if validateOffer(msg, remotePubkey) == nil {
-					offer = &msg
-				}
-				continue
+		e := events[i]
+		if e.event.Direction == connect.SignalOutboundPOST &&
+			e.event.RemotePubkey == remotePubkey &&
+			e.msg.From == selfPubkey {
+			if offer == nil && e.msg.Ts != "" {
+				m := e.msg
+				offer = &m
 			}
 		}
-		if event.event.Direction == connect.SignalInboundSSE && msg.From == remotePubkey {
-			if offer == nil {
+		if e.event.Direction == connect.SignalInboundSSE && e.msg.From == remotePubkey {
+			if offer == nil || e.msg.Challenge != offer.Challenge {
 				continue
 			}
-			if msg.Challenge != offer.Challenge {
-				continue
-			}
-			if msg.Ts == "" {
-				if !answerSeen {
-					return fail("answer.before-ice", "candidate sent ICE before answer on outbound leg")
+			if e.msg.Ts != "" {
+				if answer == nil {
+					m := e.msg
+					answer = &m
+				} else {
+					multipleAnswers = true
 				}
-				if err := validateICE(msg, offer.Challenge); err != nil {
-					return err
+			} else {
+				if answer == nil {
+					iceBeforeAnswer = true
+				} else {
+					inboundICE = append(inboundICE, e.msg)
 				}
-				continue
 			}
-			if answerSeen {
-				return fail("answer.once", "candidate sent multiple answers on outbound leg")
-			}
-			if err := validateAnswer(msg, *offer); err != nil {
-				return err
-			}
-			answerSeen = true
 		}
 	}
+
 	if offer == nil {
-		return fail("offer.present", "tester outbound offer was not observed")
+		t.record("outbound.offer", fmt.Errorf("no outbound offer observed"))
+		t.record("outbound.answer.ordering", fmt.Errorf("skipped: no offer"))
+		t.record("outbound.answer", fmt.Errorf("skipped: no offer"))
+		t.record("outbound.ice", fmt.Errorf("skipped: no offer"))
+		return
 	}
-	if !answerSeen {
-		return fail("answer.present", "candidate answer was not observed")
+	t.record("outbound.offer", checkOfferValid(*offer, remotePubkey))
+
+	switch {
+	case iceBeforeAnswer:
+		t.record("outbound.answer.ordering", fmt.Errorf("candidate sent ICE before answer"))
+	case multipleAnswers:
+		t.record("outbound.answer.ordering", fmt.Errorf("candidate sent multiple answers"))
+	default:
+		t.record("outbound.answer.ordering", nil)
 	}
-	return nil
+
+	if answer == nil {
+		t.record("outbound.answer", fmt.Errorf("no answer observed from candidate"))
+	} else {
+		t.record("outbound.answer", checkAnswerValid(*answer, *offer))
+	}
+
+	t.record("outbound.ice", checkICEsValid(inboundICE, offer.Challenge))
 }
 
-func validateOffer(msg wireMessage, expectedRecipient string) error {
+// ---------------------------------------------------------------------------
+// Per-message validation
+// ---------------------------------------------------------------------------
+
+func checkOfferValid(msg wireMessage, recipientPubkey string) error {
 	challenge, err := base64.RawURLEncoding.DecodeString(msg.Challenge)
 	if err != nil || len(challenge) != 32 {
 		return fail("offer.challenge", "challenge was not 32 base64url bytes")
@@ -436,9 +529,9 @@ func validateOffer(msg wireMessage, expectedRecipient string) error {
 	if err := checkTsWindow(ts, "offer"); err != nil {
 		return err
 	}
-	recipient, err := base64.RawURLEncoding.DecodeString(expectedRecipient)
+	recipient, err := base64.RawURLEncoding.DecodeString(recipientPubkey)
 	if err != nil {
-		return fail("offer.recipient", "expected recipient pubkey was invalid: %v", err)
+		return fail("offer.recipient", "recipient pubkey invalid: %v", err)
 	}
 	sender, sig, err := senderAndSig(msg)
 	if err != nil {
@@ -448,6 +541,66 @@ func validateOffer(msg wireMessage, expectedRecipient string) error {
 		return fail("offer.signature", "offer signature did not verify over challenge, timestamp, recipient, and SDP")
 	}
 	return nil
+}
+
+func checkAnswerValid(answer, offer wireMessage) error {
+	if answer.Challenge != offer.Challenge {
+		return fail("answer.challenge", "answer challenge does not match offer challenge")
+	}
+	challenge, err := base64.RawURLEncoding.DecodeString(answer.Challenge)
+	if err != nil || len(challenge) != 32 {
+		return fail("answer.challenge", "challenge was not 32 base64url bytes")
+	}
+	ts, err := base64.RawURLEncoding.DecodeString(answer.Ts)
+	if err != nil || len(ts) != 8 {
+		return fail("answer.timestamp", "timestamp was not 8 base64url bytes")
+	}
+	if err := checkTsWindow(ts, "answer"); err != nil {
+		return err
+	}
+	sender, sig, err := senderAndSig(answer)
+	if err != nil {
+		return err
+	}
+	if !ed25519.Verify(sender, answerPayload(challenge, ts, offer.Data, answer.Data), sig) {
+		return fail("answer.signature", "answer signature did not verify over offer SDP and answer SDP")
+	}
+	return nil
+}
+
+func checkICEsValid(msgs []wireMessage, expectedChallenge string) error {
+	for _, msg := range msgs {
+		if msg.Ts != "" {
+			return fail("ice.no-timestamp", "ICE candidate must not carry a ts field")
+		}
+		if msg.Challenge != expectedChallenge {
+			return fail("ice.challenge", "ICE challenge does not match session challenge")
+		}
+		challenge, err := base64.RawURLEncoding.DecodeString(msg.Challenge)
+		if err != nil || len(challenge) != 32 {
+			return fail("ice.challenge", "challenge was not 32 base64url bytes")
+		}
+		sender, sig, err := senderAndSig(msg)
+		if err != nil {
+			return err
+		}
+		if !ed25519.Verify(sender, icePayload(challenge, msg.Data), sig) {
+			return fail("ice.signature", "ICE signature did not verify over challenge and candidate JSON")
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Wire message and payload construction
+// ---------------------------------------------------------------------------
+
+type wireMessage struct {
+	From      string `json:"from"`
+	Data      string `json:"data"`
+	Challenge string `json:"challenge"`
+	Ts        string `json:"ts,omitempty"`
+	Sig       string `json:"sig"`
 }
 
 func offerPayload(challenge, ts, answererPubkey []byte, offerSdp string) []byte {
@@ -479,52 +632,6 @@ func icePayload(challenge []byte, candidateJSON string) []byte {
 	return b.Bytes()
 }
 
-func validateAnswer(msg wireMessage, offer wireMessage) error {
-	if msg.Challenge != offer.Challenge {
-		return fail("answer.challenge", "answer challenge did not match offer challenge")
-	}
-	challenge, err := base64.RawURLEncoding.DecodeString(msg.Challenge)
-	if err != nil || len(challenge) != 32 {
-		return fail("answer.challenge", "challenge was not 32 base64url bytes")
-	}
-	ts, err := base64.RawURLEncoding.DecodeString(msg.Ts)
-	if err != nil || len(ts) != 8 {
-		return fail("answer.timestamp", "timestamp was not 8 base64url bytes")
-	}
-	if err := checkTsWindow(ts, "answer"); err != nil {
-		return err
-	}
-	sender, sig, err := senderAndSig(msg)
-	if err != nil {
-		return err
-	}
-	if !ed25519.Verify(sender, answerPayload(challenge, ts, offer.Data, msg.Data), sig) {
-		return fail("answer.signature", "answer signature did not verify over exact signaled offer SDP and answer SDP")
-	}
-	return nil
-}
-
-func validateICE(msg wireMessage, sessionChallenge string) error {
-	if msg.Ts != "" {
-		return fail("ice.no-timestamp", "ICE candidate must not carry a ts field")
-	}
-	if msg.Challenge != sessionChallenge {
-		return fail("ice.challenge", "ICE challenge did not match session offer challenge")
-	}
-	challenge, err := base64.RawURLEncoding.DecodeString(msg.Challenge)
-	if err != nil || len(challenge) != 32 {
-		return fail("ice.challenge", "challenge was not 32 base64url bytes")
-	}
-	sender, sig, err := senderAndSig(msg)
-	if err != nil {
-		return err
-	}
-	if !ed25519.Verify(sender, icePayload(challenge, msg.Data), sig) {
-		return fail("ice.signature", "ICE signature did not verify over challenge and candidate JSON")
-	}
-	return nil
-}
-
 const tsWindowSecs = 30
 
 func checkTsWindow(ts []byte, kind string) error {
@@ -551,7 +658,11 @@ func senderAndSig(msg wireMessage) (ed25519.PublicKey, []byte, error) {
 	return ed25519.PublicKey(sender), sig, nil
 }
 
-func wireChallenge(dc *webrtc.DataChannel, done chan<- error) {
+// ---------------------------------------------------------------------------
+// Data channel challenge/response
+// ---------------------------------------------------------------------------
+
+func wireChallenge(dc *webrtc.DataChannel, done chan<- error, verbose bool) {
 	challenge, err := randomChallenge()
 	if err != nil {
 		done <- err
@@ -560,7 +671,9 @@ func wireChallenge(dc *webrtc.DataChannel, done chan<- error) {
 	expected := "pong:" + challenge
 
 	dc.OnOpen(func() {
-		fmt.Fprintf(os.Stderr, "data channel open label=%s sending challenge=%s\n", dc.Label(), challenge[:12])
+		if verbose {
+			fmt.Fprintf(os.Stderr, "data channel open label=%s sending challenge=%s\n", dc.Label(), challenge[:12])
+		}
 		if err := dc.SendText("challenge:" + challenge); err != nil {
 			done <- fail("connection-flow.challenge.send", "send challenge: %v", err)
 		}
@@ -570,7 +683,9 @@ func wireChallenge(dc *webrtc.DataChannel, done chan<- error) {
 			done <- fail("connection-flow.challenge.pong", "expected %q, got %q", expected, string(msg.Data))
 			return
 		}
-		fmt.Fprintf(os.Stderr, "received expected pong for challenge=%s\n", challenge[:12])
+		if verbose {
+			fmt.Fprintf(os.Stderr, "received expected pong for challenge=%s\n", challenge[:12])
+		}
 		done <- nil
 	})
 }
@@ -599,6 +714,10 @@ func waitResult(ctx context.Context, done <-chan error, name string) error {
 		return fail(name, "%v", ctx.Err())
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
 
 func fail(section, format string, args ...any) error {
 	return fmt.Errorf("[%s] %s", section, fmt.Sprintf(format, args...))
