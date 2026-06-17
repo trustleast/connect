@@ -46,9 +46,11 @@ func (h *hub) cleanUnownedConnections(ctx context.Context, peerFinder PeerFinder
 				return
 			}
 
+			thisNode := peerFinder.Node()
 			h.clients.Range(func(k, val any) bool {
 				pubkey := k.(string)
-				if target := targetPeer(peerFinder, pubkey); target == nil {
+				target := targetPeer(peerFinder, pubkey)
+				if target == nil || target.Host != thisNode.Host {
 					c := val.(*conn)
 					if h.clients.CompareAndDelete(k, c) {
 						c.nc.Close()

@@ -40,7 +40,6 @@ type serverConfig struct {
 	Addr          string
 	ZoneName      string
 	ClusterSecret string
-	Peers         []string
 	Network       string
 	AWSRegion     string // detected at startup from env or IMDS; not a flag
 }
@@ -60,7 +59,6 @@ func getConfig(ctx context.Context) (serverConfig, error) {
 	network := flag.String("network", cfg.Network, "listen network (tcp, tcp4, tcp6)")
 	configS3 := flag.String("config-s3", "", "S3 URI for JSON instance config, e.g. s3://bucket/key")
 	clusterSecret := flag.String("cluster-secret", "", "shared HRW hash secret; all nodes must use the same value")
-	peers := flag.String("peers", "", "comma-separated static peer base URLs, e.g. http://localhost:8081,http://localhost:8082")
 	zoneName := flag.String("zone-name", "", "DNS zone for peer URL derivation, e.g. example.com")
 	flag.Parse()
 
@@ -91,8 +89,6 @@ func getConfig(ctx context.Context) (serverConfig, error) {
 			cfg.Network = *network
 		case "cluster-secret":
 			cfg.ClusterSecret = *clusterSecret
-		case "peers":
-			cfg.Peers = strings.Split(*peers, ",")
 		case "zone-name":
 			cfg.ZoneName = *zoneName
 		}
@@ -124,8 +120,7 @@ func (cfg serverConfig) getPeerFinder(ctx context.Context) (connect.PeerFinder, 
 		return nil, fmt.Errorf("no public IPv6 address found on any interface; cannot derive node URL for zone %q", cfg.ZoneName)
 	}
 
-	switch {
-	case cfg.ASG != "":
+	if cfg.ASG != "" {
 		awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(cfg.AWSRegion))
 		if err != nil {
 			return nil, fmt.Errorf("loading AWS config for peer finder: %w", err)
@@ -133,8 +128,6 @@ func (cfg serverConfig) getPeerFinder(ctx context.Context) (connect.PeerFinder, 
 		pf := newEC2PeerFinder(ec2svc.NewFromConfig(awsCfg), u, cfg.ASG, cfg.ZoneName, scheme, cfg.ClusterSecret)
 		pf.start(ctx)
 		return pf, nil
-	case len(cfg.Peers) > 0:
-		return newStaticPeerFinder(u, cfg.Peers, cfg.ClusterSecret)
 	}
 
 	return nil, nil
@@ -234,37 +227,6 @@ func buildTLS(certB64, keyB64 string) (*tls.Config, error) {
 		MinVersion:   tls.VersionTLS13,
 	}, nil
 }
-
-// staticPeerFinder implements connect.PeerFinder for a fixed peer list.
-// OnChange returns a channel that is never written to because the peer set never changes.
-type staticPeerFinder struct {
-	nodeURL  *url.URL
-	peers    []*url.URL
-	onChange chan struct{}
-	secret   [32]byte
-}
-
-func newStaticPeerFinder(nodeURL *url.URL, peerStrs []string, secret string) (*staticPeerFinder, error) {
-	peerURLs := make([]*url.URL, 0, len(peerStrs))
-	for _, p := range peerStrs {
-		u, err := url.Parse(strings.TrimSpace(p))
-		if err != nil {
-			return nil, err
-		}
-		peerURLs = append(peerURLs, u)
-	}
-	return &staticPeerFinder{
-		nodeURL:  nodeURL,
-		peers:    peerURLs,
-		onChange: make(chan struct{}),
-		secret:   sha256.Sum256([]byte(secret)),
-	}, nil
-}
-
-func (f *staticPeerFinder) Node() *url.URL            { return f.nodeURL }
-func (f *staticPeerFinder) Peers() []*url.URL         { return f.peers }
-func (f *staticPeerFinder) OnChange() <-chan struct{} { return f.onChange }
-func (f *staticPeerFinder) Secret() [32]byte          { return f.secret }
 
 // ec2PeerFinder periodically queries EC2 for all running instances in an ASG
 // and exposes their node URLs for pubkey-based routing.
