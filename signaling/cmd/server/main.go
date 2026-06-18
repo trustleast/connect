@@ -41,7 +41,7 @@ type serverConfig struct {
 	ZoneName      string
 	ClusterSecret string
 	Network       string
-	AWSRegion     string // detected at startup from env or IMDS; not a flag
+	AWSRegion     string
 }
 
 func getConfig(ctx context.Context) (serverConfig, error) {
@@ -62,8 +62,6 @@ func getConfig(ctx context.Context) (serverConfig, error) {
 	zoneName := flag.String("zone-name", "", "DNS zone for peer URL derivation, e.g. example.com")
 	flag.Parse()
 
-	log.Println("Preparing to detect region")
-	os.Stdout.Sync()
 	region, err := detectRegion(ctx)
 	if err != nil {
 		return serverConfig{}, err

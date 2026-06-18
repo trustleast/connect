@@ -35,7 +35,13 @@ variable "domain" {
   description = "Base domain for signaling (e.g. connect.example.com). Node records are created as node-{hash}.{zone}."
 }
 
-variable "ssh_pub_key" {
+variable "acme_email" {
   type        = string
-  description = "SSH public key added to ec2-user's authorized_keys on each instance."
+  description = "Email address for Let's Encrypt account registration and expiry notifications."
+}
+
+variable "cluster_secret" {
+  type        = string
+  sensitive   = true
+  description = "Shared HRW hash secret for cluster routing. All nodes in all regions must use the same value."
 }

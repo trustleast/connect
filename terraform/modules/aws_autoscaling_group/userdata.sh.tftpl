@@ -40,13 +40,6 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
-mkdir -p /home/ec2-user/.ssh
-cat <<EOT >> /home/ec2-user/.ssh/authorized_keys
-${ssh_pub_key}
-EOT
-chmod 600 /home/ec2-user/.ssh/authorized_keys
-chown -R ec2-user:ec2-user /home/ec2-user/.ssh
-
 systemctl daemon-reload
 systemctl enable connect
 systemctl start connect

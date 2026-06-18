@@ -12,6 +12,80 @@ terraform {
   }
 }
 
+data "aws_region" "current" {}
+
+locals {
+  repo_root = abspath("${path.module}/../../../signaling")
+
+  # SHA1 over every Go source file (sorted for determinism). Changes exactly
+  # when the binary changes, so a new build produces a new launch template
+  # version and triggers an ASG instance refresh automatically.
+  source_hash = sha1(join("", [
+    for f in sort(tolist(fileset(local.repo_root, "**/*.go"))) :
+    filesha1("${local.repo_root}/${f}")
+  ]))
+
+  binary_path   = "connect-arm64"
+  binary_s3_uri = "s3://${aws_s3_bucket.config.bucket}/connect-arm64"
+
+  # Known before the ASG resource is created — matches aws_autoscaling_group.this.name.
+  asg_name = "${var.name}-${var.stage}"
+
+  user_data = base64encode(templatefile("${path.module}/userdata.sh.tftpl", {
+    source_hash   = local.source_hash
+    binary_s3_uri = local.binary_s3_uri
+    args = join(" ", [
+      "-addr", "[::]:443",
+      "-network", "tcp6",
+      "-config-s3", "s3://${aws_s3_bucket.config.bucket}/config.json",
+      "-zone-name", var.zone_name,
+    ])
+  }))
+}
+
+resource "aws_s3_bucket" "config" {
+  bucket_prefix = "connect-${var.stage}-${data.aws_region.current.region}-"
+}
+
+# Build the Go binary (ARM64 Linux). Reruns only when a .go file changes.
+resource "terraform_data" "build_binary" {
+  triggers_replace = {
+    sha = local.source_hash
+  }
+
+  provisioner "local-exec" {
+    command = "go build -trimpath -o '${local.binary_path}' ../signaling/cmd/server/"
+    environment = {
+      CGO_ENABLED = "0"
+      GOARCH      = "arm64"
+      GOOS        = "linux"
+    }
+  }
+}
+
+resource "aws_s3_object" "binary" {
+  depends_on  = [terraform_data.build_binary]
+  bucket      = aws_s3_bucket.config.bucket
+  key         = "connect-arm64"
+  source      = local.binary_path
+  source_hash = local.source_hash
+}
+
+# Instance config. Cert and Key are base64-encoded PEM (matching buildTLS in
+# main.go). ASG name is derived from variables so this can be uploaded before
+# the ASG resource is created.
+resource "aws_s3_object" "config" {
+  bucket       = aws_s3_bucket.config.bucket
+  key          = "config.json"
+  content_type = "application/json"
+  content = jsonencode({
+    Cert = base64encode(var.cert_pem)
+    Key  = base64encode(var.key_pem)
+    # ASG           = local.asg_name
+    # ClusterSecret = var.cluster_secret
+  })
+}
+
 data "aws_iam_policy_document" "instance_assume_role" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -33,16 +107,21 @@ resource "aws_iam_role" "instance" {
 
     policy = jsonencode({
       Version = "2012-10-17"
-      Statement = concat(
-        [
-          {
-            Action   = ["ec2:DescribeInstances"]
-            Effect   = "Allow"
-            Resource = "*"
-          },
-        ],
-        var.extra_permissions
-      )
+      Statement = [
+        {
+          Effect   = "Allow"
+          Action   = ["ec2:DescribeInstances"]
+          Resource = "*"
+        },
+        {
+          Effect = "Allow"
+          Action = ["s3:GetObject"]
+          Resource = [
+            "${aws_s3_bucket.config.arn}/connect-arm64",
+            "${aws_s3_bucket.config.arn}/config.json",
+          ]
+        },
+      ]
     })
   }
 }
@@ -51,6 +130,13 @@ resource "aws_iam_instance_profile" "instance" {
   name = "${var.name}-${var.stage}"
   role = aws_iam_role.instance.name
 }
+
+resource "aws_iam_role_policy_attachment" "ssm" {
+  role       = aws_iam_role.instance.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+# ── Security group ────────────────────────────────────────────────────────────
 
 data "cloudflare_ip_ranges" "ip_ranges" {}
 
@@ -65,13 +151,6 @@ resource "aws_security_group" "instance" {
     protocol         = "tcp"
     ipv6_cidr_blocks = data.cloudflare_ip_ranges.ip_ranges.ipv6_cidr_blocks
     cidr_blocks      = data.cloudflare_ip_ranges.ip_ranges.ipv4_cidr_blocks
-  }
-
-  ingress {
-    from_port        = 22
-    to_port          = 22
-    protocol         = "tcp"
-    ipv6_cidr_blocks = ["::/0"]
   }
 
   ingress {
@@ -90,6 +169,8 @@ resource "aws_security_group" "instance" {
   }
 }
 
+# ── Launch template + ASG ─────────────────────────────────────────────────────
+
 resource "aws_launch_template" "this" {
   name = "${var.name}-${var.stage}"
 
@@ -99,7 +180,7 @@ resource "aws_launch_template" "this" {
 
   image_id      = var.ami_id
   instance_type = var.instance_type
-  user_data     = var.user_data
+  user_data     = local.user_data
 
   credit_specification {
     cpu_credits = "standard"
@@ -142,7 +223,10 @@ resource "aws_launch_template" "this" {
 }
 
 resource "aws_autoscaling_group" "this" {
-  name             = "${var.name}-${var.stage}"
+  # Ensure binary and config are in S3 before any instance can start.
+  depends_on = [aws_s3_object.binary, aws_s3_object.config]
+
+  name             = local.asg_name
   min_size         = var.min_size
   max_size         = var.max_size
   desired_capacity = var.desired_capacity
@@ -167,7 +251,7 @@ resource "aws_autoscaling_group" "this" {
 
   tag {
     key                 = "Name"
-    value               = "${var.name}-${var.stage}"
+    value               = local.asg_name
     propagate_at_launch = true
   }
 
