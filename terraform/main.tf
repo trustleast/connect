@@ -77,6 +77,7 @@ module "region" {
 
   stage         = var.stage
   instance_type = var.instance_type
+  ssh_pub_key   = var.ssh_pub_key
 
   cloudflare_zone_id   = var.cloudflare_zone_id
   cloudflare_api_token = var.cloudflare_api_token

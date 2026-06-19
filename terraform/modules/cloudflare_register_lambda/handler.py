@@ -16,17 +16,16 @@ DRAINING_TTL = timedelta(minutes=5)
 
 
 def cf_token():
-    log.info("fetching CF API token from SSM: %s", os.environ["CF_API_TOKEN_SSM_PATH"])
     ssm = boto3.client("ssm", region_name=os.environ["AWS_REGION"])
     value = ssm.get_parameter(
         Name=os.environ["CF_API_TOKEN_SSM_PATH"], WithDecryption=True
     )["Parameter"]["Value"]
-    log.info("CF API token fetched")
     return value
 
 
 def cf(method, path, token, body=None):
-    log.info("CF %s %s body=%s", method, path, json.dumps(body) if body else None)
+    log.info("CF %s %s body=%s", method, path,
+             json.dumps(body) if body else None)
     req = urllib.request.Request(
         f"{CF_API}{path}",
         data=json.dumps(body).encode() if body else None,
@@ -52,14 +51,16 @@ def instance_ipv6(instance_id):
         "Reservations"][0]["Instances"][0]
     for iface in inst.get("NetworkInterfaces", []):
         for addr in iface.get("Ipv6Addresses", []):
-            log.info("found IPv6 %s for instance %s", addr["Ipv6Address"], instance_id)
+            log.info("found IPv6 %s for instance %s",
+                     addr["Ipv6Address"], instance_id)
             return addr["Ipv6Address"]
     raise ValueError(f"no IPv6 address found for {instance_id}")
 
 
 def asg_instances(asg_name, exclude_id=None):
     """Return list of (instance_id, ipv6) for all running/pending ASG instances."""
-    log.info("querying ASG instances for %s (excluding %s)", asg_name, exclude_id)
+    log.info("querying ASG instances for %s (excluding %s)",
+             asg_name, exclude_id)
     ec2 = boto3.client("ec2", region_name=os.environ["AWS_REGION"])
     paginator = ec2.get_paginator("describe_instances")
     instances = []
@@ -73,7 +74,8 @@ def asg_instances(asg_name, exclude_id=None):
                     continue
                 for iface in inst.get("NetworkInterfaces", []):
                     for addr in iface.get("Ipv6Addresses", []):
-                        instances.append((inst["InstanceId"], addr["Ipv6Address"]))
+                        instances.append(
+                            (inst["InstanceId"], addr["Ipv6Address"]))
     log.info("found %d ASG instances: %s", len(instances), instances)
     return instances
 
@@ -116,19 +118,35 @@ def set_domain_records(zone_id, token, domain, ips, comment):
 def cleanup_draining(zone_id, token):
     """Delete draining CNAME records that have been stale for more than 5 minutes."""
     now = datetime.now(timezone.utc)
-    records = get_records(zone_id, token, type="CNAME", **{"comment.startswith": "draining:"})
+    records = get_records(zone_id, token, type="CNAME", **
+                          {"comment.startswith": "draining:"})
     for rec in records:
         modified = datetime.fromisoformat(rec["modified_on"])
         age = now - modified
         if age > DRAINING_TTL:
-            log.info("deleting stale draining record %s (age=%s)", rec["name"], age)
+            log.info("deleting stale draining record %s (age=%s)",
+                     rec["name"], age)
             cf("DELETE", f"/zones/{zone_id}/dns_records/{rec['id']}", token)
         else:
-            log.info("draining record %s is only %s old, leaving it", rec["name"], age)
+            log.info("draining record %s is only %s old, leaving it",
+                     rec["name"], age)
+
+
+def cleanup_orphaned_nodes(zone_id, token, domain, active_ips):
+    """Delete node AAAA records whose IP is no longer in the active instance set."""
+    records = get_records(zone_id, token, type="AAAA", **
+                          {"comment.startswith": "signaling-node:"})
+    active_set = set(active_ips)
+    for rec in records:
+        if rec["content"] not in active_set:
+            log.info("deleting orphaned node record %s -> %s",
+                     rec["name"], rec["content"])
+            cf("DELETE", f"/zones/{zone_id}/dns_records/{rec['id']}", token)
 
 
 def complete_hook(detail):
-    log.info("completing lifecycle hook %s with CONTINUE", detail["LifecycleHookName"])
+    log.info("completing lifecycle hook %s with CONTINUE",
+             detail["LifecycleHookName"])
     boto3.client("autoscaling", region_name=os.environ["AWS_REGION"]).complete_lifecycle_action(
         LifecycleHookName=detail["LifecycleHookName"],
         AutoScalingGroupName=detail["AutoScalingGroupName"],
@@ -149,7 +167,8 @@ def reconcile(asg_name):
     active_ips = [ip for _, ip in instances]
     log.info("reconciling %d active instances: %s", len(instances), instances)
 
-    set_domain_records(zone_id, token, domain, active_ips, "signaling-round-robin")
+    set_domain_records(zone_id, token, domain, active_ips,
+                       "signaling-round-robin")
 
     for inst_id, inst_ip in instances:
         inst_node = node_hostname(inst_ip, zone_name)
@@ -160,6 +179,7 @@ def reconcile(asg_name):
                 "comment": f"signaling-node:{inst_id}",
             })
 
+    cleanup_orphaned_nodes(zone_id, token, domain, active_ips)
     cleanup_draining(zone_id, token)
 
 
@@ -195,7 +215,8 @@ def handler(event, context):
     # Exclude the terminating instance on scale-down; include the new instance
     # on scale-up even if EC2 doesn't yet show it as "running".
     try:
-        instances = asg_instances(asg_name, exclude_id=None if is_launch else instance_id)
+        instances = asg_instances(
+            asg_name, exclude_id=None if is_launch else instance_id)
         if is_launch and ip not in [i for _, i in instances]:
             instances.append((instance_id, ip))
     except Exception as e:
@@ -207,7 +228,8 @@ def handler(event, context):
 
     # 1. Set main domain round-robin to exactly the active instance set.
     try:
-        set_domain_records(zone_id, token, domain, active_ips, "signaling-round-robin")
+        set_domain_records(zone_id, token, domain,
+                           active_ips, "signaling-round-robin")
     except Exception as e:
         log.error("failed to set domain round-robin for %s: %s", domain, e)
 
@@ -225,18 +247,25 @@ def handler(event, context):
             log.error("failed to ensure node record %s: %s", inst_node, e)
 
     # 3. On scale-down: flip the terminating node's record to a CNAME so cached
-    #    clients following the redirect land on an active node.
+    #    clients following the redirect land on an active node. If no AAAA record
+    #    exists (e.g. launch handler failed), create the CNAME directly so clients
+    #    with any stale DNS entry are still redirected.
     if not is_launch:
         try:
             records = get_records(zone_id, token, name=node_name, type="AAAA")
+            draining_body = {
+                "type": "CNAME", "name": node_name, "content": domain,
+                "proxied": True, "ttl": 1,
+                "comment": f"draining:{instance_id}",
+            }
             if records:
-                cf("PUT", f"/zones/{zone_id}/dns_records/{records[0]['id']}", token, {
-                    "type": "CNAME", "name": node_name, "content": domain,
-                    "proxied": True, "ttl": 1,
-                    "comment": f"draining:{instance_id}",
-                })
+                cf("PUT",
+                   f"/zones/{zone_id}/dns_records/{records[0]['id']}", token, draining_body)
             else:
-                log.warning("no AAAA record found for %s, skipping CNAME flip", node_name)
+                log.info(
+                    "no AAAA record found for %s, creating draining CNAME directly", node_name)
+                cf("POST", f"/zones/{zone_id}/dns_records",
+                   token, draining_body)
         except Exception as e:
             log.error("failed to flip node record %s to CNAME: %s", node_name, e)
 
@@ -252,7 +281,8 @@ def handler(event, context):
 if __name__ == "__main__":
     import argparse
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    p = argparse.ArgumentParser(description="Reconcile Cloudflare DNS to current ASG state")
+    p = argparse.ArgumentParser(
+        description="Reconcile Cloudflare DNS to current ASG state")
     p.add_argument("--asg-name", required=True, help="Auto Scaling Group name")
     args = p.parse_args()
     reconcile(args.asg_name)

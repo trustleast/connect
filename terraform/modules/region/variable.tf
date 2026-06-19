@@ -25,6 +25,11 @@ variable "domain" {
   type = string
 }
 
+variable "ssh_pub_key" {
+  type        = string
+  description = "SSH public key added to ec2-user's authorized_keys on each instance."
+}
+
 variable "cert_pem" {
   type        = string
   description = "PEM-encoded TLS certificate (full chain, leaf + intermediates) for HTTPS."

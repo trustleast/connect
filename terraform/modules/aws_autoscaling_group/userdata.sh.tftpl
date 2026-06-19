@@ -15,6 +15,17 @@ s3 =
     use_dualstack_endpoint = true
 EOF
 
+# Configure SSM agent to use dual-stack endpoints so it can reach AWS APIs
+# over IPv6. The *.api.aws hostnames have AAAA records; the default
+# *.amazonaws.com hostnames are IPv4-only.
+mkdir -p /etc/amazon/ssm
+cat > /etc/amazon/ssm/amazon-ssm-agent.json <<EOF
+{
+  "Mds":  { "Endpoint": "https://ec2messages.${region}.api.aws" },
+  "Ssm":  { "Endpoint": "https://ssm.${region}.api.aws" }
+}
+EOF
+
 # Pull the latest binary from S3 before each start.
 cat > /usr/local/bin/connect-update <<'EOF'
 #!/bin/bash
@@ -39,6 +50,13 @@ RestartSec=2
 [Install]
 WantedBy=multi-user.target
 EOF
+
+mkdir -p /home/ec2-user/.ssh
+cat <<EOT >> /home/ec2-user/.ssh/authorized_keys
+${ssh_pub_key}
+EOT
+chmod 600 /home/ec2-user/.ssh/authorized_keys
+chown -R ec2-user:ec2-user /home/ec2-user/.ssh
 
 systemctl daemon-reload
 systemctl enable connect

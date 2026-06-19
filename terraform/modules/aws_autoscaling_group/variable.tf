@@ -40,7 +40,12 @@ variable "max_size" {
 
 variable "desired_capacity" {
   type    = number
-  default = 2
+  default = 1
+}
+
+variable "ssh_pub_key" {
+  type        = string
+  description = "SSH public key added to ec2-user's authorized_keys on each instance."
 }
 
 variable "zone_name" {

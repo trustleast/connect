@@ -119,11 +119,10 @@ func (cfg serverConfig) getPeerFinder(ctx context.Context) (connect.PeerFinder, 
 	}
 
 	if cfg.ASG != "" {
-		awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(cfg.AWSRegion))
+		pf, err := newEC2PeerFinder(ctx, cfg.AWSRegion, u, cfg.ASG, cfg.ZoneName, scheme, cfg.ClusterSecret)
 		if err != nil {
-			return nil, fmt.Errorf("loading AWS config for peer finder: %w", err)
+			return nil, err
 		}
-		pf := newEC2PeerFinder(ec2svc.NewFromConfig(awsCfg), u, cfg.ASG, cfg.ZoneName, scheme, cfg.ClusterSecret)
 		pf.start(ctx)
 		return pf, nil
 	}
@@ -240,7 +239,14 @@ type ec2PeerFinder struct {
 	secret   [32]byte
 }
 
-func newEC2PeerFinder(client *ec2svc.Client, nodeURL *url.URL, asgName, zoneName, scheme, secret string) *ec2PeerFinder {
+func newEC2PeerFinder(ctx context.Context, region string, nodeURL *url.URL, asgName, zoneName, scheme, secret string) (*ec2PeerFinder, error) {
+	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	if err != nil {
+		return nil, err
+	}
+	client := ec2svc.NewFromConfig(awsCfg, func(o *ec2svc.Options) {
+		o.EndpointOptions.UseDualStackEndpoint = aws.DualStackEndpointStateEnabled
+	})
 	return &ec2PeerFinder{
 		onChange: make(chan struct{}, 1),
 		secret:   sha256.Sum256([]byte(secret)),
@@ -249,16 +255,11 @@ func newEC2PeerFinder(client *ec2svc.Client, nodeURL *url.URL, asgName, zoneName
 		zoneName: zoneName,
 		scheme:   scheme,
 		nodeURL:  nodeURL,
-	}
+	}, nil
 }
 
 func (f *ec2PeerFinder) Node() *url.URL {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	if len(f.peers) == 0 {
-		return nil
-	}
-	return f.peers[0]
+	return f.nodeURL
 }
 
 func (f *ec2PeerFinder) Peers() []*url.URL {

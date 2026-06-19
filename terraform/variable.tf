@@ -35,6 +35,11 @@ variable "domain" {
   description = "Base domain for signaling (e.g. connect.example.com). Node records are created as node-{hash}.{zone}."
 }
 
+variable "ssh_pub_key" {
+  type        = string
+  description = "SSH public key added to ec2-user's authorized_keys on each instance."
+}
+
 variable "acme_email" {
   type        = string
   description = "Email address for Let's Encrypt account registration and expiry notifications."

@@ -34,6 +34,8 @@ locals {
   user_data = base64encode(templatefile("${path.module}/userdata.sh.tftpl", {
     source_hash   = local.source_hash
     binary_s3_uri = local.binary_s3_uri
+    ssh_pub_key   = var.ssh_pub_key
+    region        = data.aws_region.current.region
     args = join(" ", [
       "-addr", "[::]:443",
       "-network", "tcp6",
@@ -79,10 +81,10 @@ resource "aws_s3_object" "config" {
   key          = "config.json"
   content_type = "application/json"
   content = jsonencode({
-    Cert = base64encode(var.cert_pem)
-    Key  = base64encode(var.key_pem)
-    # ASG           = local.asg_name
-    # ClusterSecret = var.cluster_secret
+    Cert          = base64encode(var.cert_pem)
+    Key           = base64encode(var.key_pem)
+    ASG           = local.asg_name
+    ClusterSecret = var.cluster_secret
   })
 }
 
@@ -144,6 +146,13 @@ resource "aws_security_group" "instance" {
   name   = "${var.name}-${var.stage}"
   vpc_id = var.vpc_id
 
+  ingress {
+    from_port        = 22
+    to_port          = 22
+    protocol         = "tcp"
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
   # Accept signaling traffic from Cloudflare proxy IPs only.
   ingress {
     from_port        = 443
@@ -172,6 +181,8 @@ resource "aws_security_group" "instance" {
 # ── Launch template + ASG ─────────────────────────────────────────────────────
 
 resource "aws_launch_template" "this" {
+  depends_on = [aws_s3_object.binary, aws_s3_object.config]
+
   name = "${var.name}-${var.stage}"
 
   iam_instance_profile {
@@ -223,9 +234,6 @@ resource "aws_launch_template" "this" {
 }
 
 resource "aws_autoscaling_group" "this" {
-  # Ensure binary and config are in S3 before any instance can start.
-  depends_on = [aws_s3_object.binary, aws_s3_object.config]
-
   name             = local.asg_name
   min_size         = var.min_size
   max_size         = var.max_size

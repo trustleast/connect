@@ -390,9 +390,12 @@ export class ConnectClient {
   }
 
   private async send(remotePubkey: string, msg: WireMessage): Promise<void> {
+    // redirect: 'follow' re-sends the full POST body on 307, which is correct:
+    // the signed body is already computed and is valid at any node.
     const resp = await fetch(`${this.options.serverUrl}/${remotePubkey}`, {
       method: "POST",
       body: pack(msg),
+      redirect: "follow",
     });
     if (!resp.ok) {
       throw new DialError(
@@ -628,6 +631,9 @@ export class ConnectClient {
     );
 
     while (!this.closed) {
+      // Tracks whether the stream closed cleanly (server-initiated, e.g. node
+      // eviction due to HRW ownership change) vs. due to an error.
+      let cleanClose = false;
       try {
         const tsBytes = currentTs();
         const sigBytes = new Uint8Array(
@@ -641,9 +647,15 @@ export class ConnectClient {
         combined.set(sigBytes, 0);
         combined.set(tsBytes, 64);
 
+        // redirect: 'follow' transparently handles 307 redirects from regional
+        // nodes to their HRW-assigned node. The auth sig is valid at the
+        // destination as long as the redirect completes within the ±2s window
+        // (same-region redirects are well within this bound).
+        // On reconnect we always return to serverUrl, never the redirected node
+        // URL — node targeting is an implementation detail of redirect handling.
         const resp = await fetch(
           `${this.options.serverUrl}${path}?sig=${base64UrlEncode(combined)}`,
-          { signal: this.abort.signal },
+          { signal: this.abort.signal, redirect: "follow" },
         );
 
         if (!resp.ok || !resp.body)
@@ -656,7 +668,10 @@ export class ConnectClient {
 
         for (;;) {
           const { done, value } = await reader.read();
-          if (done) break;
+          if (done) {
+            cleanClose = true;
+            break;
+          }
           buf += dec.decode(value, { stream: true });
           let nl: number;
           while ((nl = buf.indexOf("\n")) >= 0) {
@@ -682,9 +697,14 @@ export class ConnectClient {
         backoff = Math.min(backoff * 2, RECONNECT_MAX_MS);
       }
 
-      // Always delay before reconnecting — clean close or error — and add
-      // jitter so two clients that share a key don't reconnect in lockstep.
-      await this.sleep(backoff + Math.random() * 1000);
+      // On clean close (server evicted this connection, e.g. HRW ownership
+      // change after scale-out), reconnect immediately so the client quickly
+      // lands on the new owner via the normal GET redirect flow.
+      // On error, delay with exponential backoff + jitter to avoid thundering
+      // herd when a node goes down and many clients reconnect simultaneously.
+      if (!cleanClose) {
+        await this.sleep(backoff + Math.random() * 1000);
+      }
     }
   }
 }

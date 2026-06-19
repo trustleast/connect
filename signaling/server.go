@@ -55,11 +55,13 @@ var (
 		"X-Accel-Buffering: no\r\n" +
 		"\r\n")
 
-	errNodeUnavailable        = errors.New("recipient not connected")
-	errInvalidPubKey          = errors.New("invalid public key")
-	errMissingSignature       = errors.New("missing ?sig= query param")
-	errInvalidEncoding        = errors.New("invalid encoding")
-	errInvalidSignatureLength = errors.New("invalid signature length")
+	errNodeUnavailable             = errors.New("recipient not connected")
+	errInvalidPubKey               = errors.New("invalid public key")
+	errMissingSignature            = errors.New("missing ?sig= query param")
+	errInvalidEncoding             = errors.New("invalid encoding")
+	errInvalidSignatureLength      = errors.New("invalid signature length")
+	errTimestampOutsideWindow      = errors.New("timestamp outside window")
+	errSignatureVerificationFailed = errors.New("signature verification failed")
 )
 
 // PeerFinder returns the current set of peer node base URLs for pubkey routing.
@@ -205,15 +207,15 @@ func (s *server) targetPeer(pubkeyStr string) *url.URL {
 //	GET  /{pubkey}  — open SSE stream (client proves ownership)
 //	POST /{pubkey}  — deliver an opaque payload to that pubkey
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h := w.Header()
 	if r.Method == http.MethodOptions {
-		h := w.Header()
-		h["Access-Control-Allow-Origin"] = corsOriginAny
 		h.Set("Access-Control-Allow-Methods", "GET, POST")
 		h.Set("Access-Control-Allow-Headers", "Content-Type")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
+	h["Access-Control-Allow-Origin"] = corsOriginAny
 	pubKey := strings.Trim(r.URL.Path, "/")
 	if len(pubKey) != 43 {
 		http.Error(w, errInvalidPubKey.Error(), http.StatusBadRequest)
@@ -223,16 +225,19 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Check if cluster routing is enabled
 	if s.peerFinder != nil {
 		if target := s.targetPeer(pubKey); target == nil {
+			fmt.Printf("No peers found for %s\n", r.Host)
 			// Cluster routing enabled but no peers found
 			respondAndDrain(r, w, http.StatusServiceUnavailable)
 			return
 		} else {
+			me := s.peerFinder.Node().Host
+			fmt.Printf("Request for %s got %s, I am: %s\n", r.Host, target.Host, me)
 			// Another node is the HRW owner. Before redirecting, check whether the
 			// request already arrived with the target's hostname — this means the
 			// client followed a previous redirect to that node but DNS fell through
 			// to us (e.g. CNAME drain). We can't find the good node yet; return 503 so
 			// the client backs off until the routing table converges.
-			if r.Host == target.Host && r.Host != s.peerFinder.Node().Host {
+			if r.Host == target.Host && r.Host != me {
 				respondAndDrain(r, w, http.StatusServiceUnavailable)
 				return
 			} else if r.Host != target.Host {
@@ -251,7 +256,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		// POST responses require Access-Control-Allow-Origin for cross-origin clients.
 		// Allow-Methods and Allow-Headers are only checked by browsers on OPTIONS preflight.
-		w.Header()["Access-Control-Allow-Origin"] = corsOriginAny
+		h["Access-Control-Allow-Origin"] = corsOriginAny
 		s.postMessage(w, r, pubKey)
 	default:
 		http.NotFound(w, r)
@@ -316,7 +321,7 @@ func (s *server) verifyAuth(rawSig []byte, pubkey ed25519.PublicKey) error {
 	delta := time.Now().Unix() - ts
 	if delta < -60 || delta > 2 {
 		s.authDecodePool.Put(rawp)
-		return fmt.Errorf("timestamp outside window")
+		return errTimestampOutsideWindow
 	}
 
 	// authMsgPool buffers are pre-filled with sseAuthDomain; only write tsBytes.
@@ -327,7 +332,7 @@ func (s *server) verifyAuth(rawSig []byte, pubkey ed25519.PublicKey) error {
 	s.authDecodePool.Put(rawp)
 
 	if !ok {
-		return fmt.Errorf("signature verification failed")
+		return errSignatureVerificationFailed
 	}
 	return nil
 }
@@ -458,5 +463,6 @@ func redirectAndDrain(r *http.Request, w http.ResponseWriter, target string) {
 		io.Copy(io.Discard, r.Body)
 		r.Body.Close()
 	}
+	w.Header().Set("Cache-Control", "public, max-age=20")
 	http.Redirect(w, r, target, http.StatusTemporaryRedirect)
 }
