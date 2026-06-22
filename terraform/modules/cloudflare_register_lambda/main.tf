@@ -79,7 +79,7 @@ resource "aws_lambda_function" "registrar" {
   source_code_hash = data.archive_file.lambda.output_base64sha256
   handler          = "handler.handler"
   runtime          = "python3.12"
-  timeout          = 30
+  timeout          = 90
 
   environment {
     variables = {

@@ -19,8 +19,10 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log"
 	mathrand "math/rand/v2"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -131,6 +133,63 @@ type wireMessage struct {
 	Sig       string `json:"sig"`
 }
 
+// redirectCacheTransport is an http.RoundTripper that caches 308 redirect
+// responses. On a cache hit it returns a synthetic 308 without a network
+// round-trip; http.Client's built-in redirect logic then follows it directly
+// to the node, skipping the entry-node hop entirely.
+type redirectCacheTransport struct {
+	mu    sync.RWMutex
+	cache map[string]redirectEntry
+}
+
+type redirectEntry struct {
+	location  string
+	expiresAt time.Time
+}
+
+func (t *redirectCacheTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	key := req.URL.String()
+
+	t.mu.RLock()
+	entry, ok := t.cache[key]
+	t.mu.RUnlock()
+
+	if ok && time.Now().Before(entry.expiresAt) {
+		log.Printf("[signaling] redirect cache hit: %s → %s", key, entry.location)
+		return &http.Response{
+			StatusCode: http.StatusPermanentRedirect,
+			Header:     http.Header{"Location": []string{entry.location}},
+			Body:       http.NoBody,
+		}, nil
+	}
+
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	if err != nil || resp.StatusCode != http.StatusPermanentRedirect {
+		return resp, err
+	}
+
+	// Cache the redirect using the TTL from Cache-Control: max-age=N.
+	location := resp.Header.Get("Location")
+	if maxAge := parseMaxAge(resp.Header.Get("Cache-Control")); location != "" && maxAge > 0 {
+		t.mu.Lock()
+		t.cache[key] = redirectEntry{location: location, expiresAt: time.Now().Add(maxAge)}
+		t.mu.Unlock()
+	}
+	return resp, nil
+}
+
+// parseMaxAge extracts the max-age seconds from a Cache-Control header value.
+func parseMaxAge(cc string) time.Duration {
+	for _, part := range strings.Split(cc, ",") {
+		if after, ok := strings.CutPrefix(strings.TrimSpace(part), "max-age="); ok {
+			if n, err := strconv.Atoi(after); err == nil && n > 0 {
+				return time.Duration(n) * time.Second
+			}
+		}
+	}
+	return 0
+}
+
 // connKey is the composite key for the conns map. Including the challenge
 // allows a single remote pubkey to have multiple simultaneous connections.
 type connKey struct {
@@ -147,9 +206,10 @@ func makeConnKey(pubkey string, challenge []byte) connKey {
 
 // Client connects to the relay server and manages WebRTC peer connections.
 type Client struct {
-	api   *webrtc.API
-	opts  options
-	conns sync.Map // connKey → *connState
+	api        *webrtc.API
+	opts       options
+	httpClient *http.Client
+	conns      sync.Map // connKey → *connState
 }
 
 // connState holds per-connection state.
@@ -225,7 +285,13 @@ func New(optFuncs ...Option) (*Client, error) {
 	if opts.SettingEngine != nil {
 		api = webrtc.NewAPI(webrtc.WithSettingEngine(*opts.SettingEngine))
 	}
-	return &Client{api: api, opts: opts}, nil
+	return &Client{
+		api:  api,
+		opts: opts,
+		httpClient: &http.Client{
+			Transport: &redirectCacheTransport{cache: make(map[string]redirectEntry)},
+		},
+	}, nil
 }
 
 // Dial opens a connection to the peer identified by remotePubkey (base64url).
@@ -416,7 +482,7 @@ func (c *Client) send(ctx context.Context, remotePubkey string, msg wireMessage)
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
 	}

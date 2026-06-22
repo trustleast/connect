@@ -231,7 +231,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		} else {
 			me := s.peerFinder.Node().Host
-			fmt.Printf("Request for %s got %s, I am: %s\n", r.Host, target.Host, me)
+			fmt.Printf("%s %s: for %s got %s, I am: %s\n", r.Method, pubKey, r.Host, target.Host, me)
 			// Another node is the HRW owner. Before redirecting, check whether the
 			// request already arrived with the target's hostname — this means the
 			// client followed a previous redirect to that node but DNS fell through
@@ -464,5 +464,5 @@ func redirectAndDrain(r *http.Request, w http.ResponseWriter, target string) {
 		r.Body.Close()
 	}
 	w.Header().Set("Cache-Control", "public, max-age=20")
-	http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+	http.Redirect(w, r, target, http.StatusPermanentRedirect)
 }
