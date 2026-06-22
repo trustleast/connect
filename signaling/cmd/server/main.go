@@ -3,25 +3,21 @@ package main
 import (
 	"cmp"
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net"
-	"net/url"
+	"os"
 	"slices"
-	"strings"
 	"sync"
+	"strings"
 	"time"
 
-	"os"
-
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	ec2svc "github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
@@ -30,109 +26,206 @@ import (
 	"connect"
 )
 
-// serverConfig is the fully resolved runtime configuration. JSON tags allow it
-// to be decoded directly from the S3 cluster config; CLI-only fields use
-// json:"-". Priority: defaults → S3 → explicit CLI flags (see getConfig).
 type serverConfig struct {
-	Cert          string
-	Key           string
-	ASG           string
-	Addr          string
-	ZoneName      string
-	ClusterSecret string
-	Network       string
-	AWSRegion     string
+	Cert       string
+	Key        string
+	ASG        string
+	Addr       string
+	Network    string
+	AWSRegion  string
+	GossipAddr string // UDP listen address for intra-AZ gossip
+	GossipPort string // gossip UDP port on peer nodes
+	ProxyURL   string // this node's internal HTTP base URL for peer proxying
 }
 
 func getConfig(ctx context.Context) (serverConfig, error) {
-	// 1. Sensible defaults.
 	cfg := serverConfig{
-		Addr:      ":8080",
-		Network:   "tcp",
-		AWSRegion: "us-east-1",
+		Addr:       ":8080",
+		Network:    "tcp",
+		AWSRegion:  "us-east-1",
+		GossipAddr: ":9876",
+		GossipPort: "9876",
 	}
 
-	// Define flags. Defaults match cfg above so the usage text is accurate, but
-	// cfg is the authoritative default — flag values are only applied when the
-	// flag was explicitly set on the command line (see flag.Visit below).
 	addr := flag.String("addr", cfg.Addr, "listen address")
 	network := flag.String("network", cfg.Network, "listen network (tcp, tcp4, tcp6)")
 	configS3 := flag.String("config-s3", "", "S3 URI for JSON instance config, e.g. s3://bucket/key")
-	clusterSecret := flag.String("cluster-secret", "", "shared HRW hash secret; all nodes must use the same value")
-	zoneName := flag.String("zone-name", "", "DNS zone for peer URL derivation, e.g. example.com")
+	gossipAddr := flag.String("gossip-addr", cfg.GossipAddr, "UDP address for intra-AZ gossip")
+	gossipPort := flag.String("gossip-port", cfg.GossipPort, "UDP port on peer nodes for gossip")
+	proxyURL := flag.String("proxy-url", "", "this node's internal HTTP base URL for peer proxying")
 	flag.Parse()
 
 	region, err := detectRegion(ctx)
 	if err != nil {
 		return serverConfig{}, err
 	}
-
 	cfg.AWSRegion = region
 
-	// 2. Apply S3 config over defaults. json.Decode only sets fields present in
-	// the JSON, so absent keys leave the defaults in cfg untouched.
 	if *configS3 != "" {
 		if err := getS3Config(ctx, *configS3, cfg.AWSRegion, &cfg); err != nil {
 			return serverConfig{}, fmt.Errorf("loading config from S3: %w", err)
 		}
 	}
 
-	// 3. Explicit CLI flags override S3. flag.Visit only visits flags that were
-	// actually set on the command line, leaving S3 values intact for the rest.
 	flag.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "addr":
 			cfg.Addr = *addr
 		case "network":
 			cfg.Network = *network
-		case "cluster-secret":
-			cfg.ClusterSecret = *clusterSecret
-		case "zone-name":
-			cfg.ZoneName = *zoneName
+		case "gossip-addr":
+			cfg.GossipAddr = *gossipAddr
+		case "gossip-port":
+			cfg.GossipPort = *gossipPort
+		case "proxy-url":
+			cfg.ProxyURL = *proxyURL
 		}
 	})
 
 	return cfg, nil
 }
 
-func (cfg serverConfig) getPeerFinder(ctx context.Context) (connect.PeerFinder, error) {
-	if cfg.ZoneName == "" {
+// setupPeerProvider builds an ec2PeerProvider if an ASG is configured.
+// Returns nil (single-node mode) when no ASG is set.
+func (cfg serverConfig) setupPeerProvider(ctx context.Context) (connect.PeerProvider, error) {
+	if cfg.ASG == "" {
 		return nil, nil
-	}
-
-	scheme := "https"
-	if cfg.Cert == "" {
-		scheme = "http"
 	}
 
 	ip, err := getPublicIP()
 	if err != nil {
 		return nil, fmt.Errorf("getting public IP: %w", err)
 	}
-
-	u, err := ipNodeURL(ip, cfg.ZoneName, scheme)
-	if err != nil {
-		return nil, fmt.Errorf("detecting node URL: %w", err)
-	}
-	if u == nil {
-		return nil, fmt.Errorf("no public IPv6 address found on any interface; cannot derive node URL for zone %q", cfg.ZoneName)
+	if ip == nil {
+		return nil, nil
 	}
 
-	if cfg.ASG != "" {
-		pf, err := newEC2PeerFinder(ctx, cfg.AWSRegion, u, cfg.ASG, cfg.ZoneName, scheme, cfg.ClusterSecret)
-		if err != nil {
-			return nil, err
+	proxyURL := cfg.ProxyURL
+	if proxyURL == "" {
+		scheme := "https"
+		if cfg.Cert == "" {
+			scheme = "http"
 		}
-		pf.start(ctx)
-		return pf, nil
+		port := cfg.Addr
+		if i := strings.LastIndex(port, ":"); i >= 0 {
+			port = port[i:]
+		}
+		proxyURL = fmt.Sprintf("%s://[%s]%s", scheme, ip.String(), port)
 	}
 
-	return nil, nil
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.AWSRegion))
+	if err != nil {
+		return nil, err
+	}
+	ec2Client := ec2svc.NewFromConfig(awsCfg, func(o *ec2svc.Options) {
+		o.EndpointOptions.UseDualStackEndpoint = aws.DualStackEndpointStateEnabled
+	})
+
+	pp := &ec2PeerProvider{
+		proxyURL:   proxyURL,
+		gossipAddr: cfg.GossipAddr,
+		gossipPort: cfg.GossipPort,
+		asgName:    cfg.ASG,
+		region:     cfg.AWSRegion,
+		selfIP:     ip,
+		ec2:        ec2Client,
+		onChange:   make(chan struct{}, 1),
+	}
+	pp.start(ctx)
+	return pp, nil
+}
+
+// ec2PeerProvider implements connect.PeerProvider by polling EC2 for running
+// instances in the same ASG.
+type ec2PeerProvider struct {
+	proxyURL   string
+	gossipAddr string
+	gossipPort string
+	asgName    string
+	region     string
+	selfIP     net.IP
+	ec2        *ec2svc.Client
+
+	mu       sync.RWMutex
+	peers    []*net.UDPAddr
+	onChange chan struct{}
+}
+
+func (p *ec2PeerProvider) Self() string             { return p.proxyURL }
+func (p *ec2PeerProvider) GossipAddr() string       { return p.gossipAddr }
+func (p *ec2PeerProvider) OnChange() <-chan struct{} { return p.onChange }
+
+func (p *ec2PeerProvider) Peers() []*net.UDPAddr {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.peers
+}
+
+func (p *ec2PeerProvider) refresh(ctx context.Context) {
+	ips, err := getASGPeerIPs(ctx, p.region, p.asgName, p.selfIP)
+	if err != nil {
+		log.Printf("peer refresh: %v", err)
+		return
+	}
+	peers := make([]*net.UDPAddr, 0, len(ips))
+	for _, ip := range ips {
+		addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("[%s]:%s", ip, p.gossipPort))
+		if err != nil {
+			log.Printf("peer refresh: resolve %s: %v", ip, err)
+			continue
+		}
+		peers = append(peers, addr)
+	}
+
+	p.mu.Lock()
+	changed := !udpAddrsEqual(p.peers, peers)
+	p.peers = peers
+	p.mu.Unlock()
+
+	if changed {
+		select {
+		case p.onChange <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (p *ec2PeerProvider) start(ctx context.Context) {
+	p.refresh(ctx)
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				p.refresh(ctx)
+			}
+		}
+	}()
+}
+
+// udpAddrsEqual reports whether two slices contain the same addresses
+// (order-independent via string comparison after sorting).
+func udpAddrsEqual(a, b []*net.UDPAddr) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[string]struct{}, len(a))
+	for _, addr := range a {
+		set[addr.String()] = struct{}{}
+	}
+	for _, addr := range b {
+		if _, ok := set[addr.String()]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func main() {
 	ctx := context.Background()
-
 	if err := run(ctx); err != nil {
 		for {
 			log.Println("fatal:", err)
@@ -147,13 +240,9 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("getting config: %w", err)
 	}
 
-	peerFinder, err := cfg.getPeerFinder(ctx)
+	pp, err := cfg.setupPeerProvider(ctx)
 	if err != nil {
 		return err
-	}
-
-	if peerFinder != nil && cfg.ClusterSecret == "" {
-		log.Println("warning: -cluster-secret not set; HRW routing uses a zero key (dev mode only)")
 	}
 
 	lc := net.ListenConfig{}
@@ -170,12 +259,12 @@ func run(ctx context.Context) error {
 		ln = tls.NewListener(ln, tlsCfg)
 	}
 
-	srv := connect.NewHTTPServer(ctx, peerFinder)
+	srv := connect.NewHTTPServer(ctx, pp)
 	return srv.Serve(ln)
 }
 
 func getS3Config(ctx context.Context, uri, region string, cfg *serverConfig) error {
-	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
 	if err != nil {
 		return err
 	}
@@ -198,13 +287,10 @@ func getS3Config(ctx context.Context, uri, region string, cfg *serverConfig) err
 	return json.NewDecoder(out.Body).Decode(cfg)
 }
 
-// buildTLS decodes base64 cert and key PEMs and returns a TLS config.
-// Returns nil if either is empty (plain HTTP mode).
 func buildTLS(certB64, keyB64 string) (*tls.Config, error) {
 	if certB64 == "" {
 		return nil, nil
 	}
-
 	certPEM, err := base64.StdEncoding.DecodeString(certB64)
 	if err != nil {
 		return nil, err
@@ -213,132 +299,46 @@ func buildTLS(certB64, keyB64 string) (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return nil, err
 	}
-
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS13,
 	}, nil
 }
 
-// ec2PeerFinder periodically queries EC2 for all running instances in an ASG
-// and exposes their node URLs for pubkey-based routing.
-type ec2PeerFinder struct {
-	mu       sync.RWMutex
-	nodeURL  *url.URL
-	peers    []*url.URL
-	onChange chan struct{}
-	ec2      *ec2svc.Client
-	asgName  string
-	zoneName string
-	scheme   string
-	secret   [32]byte
-}
-
-func newEC2PeerFinder(ctx context.Context, region string, nodeURL *url.URL, asgName, zoneName, scheme, secret string) (*ec2PeerFinder, error) {
-	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+// getASGPeerIPs returns public IPv6 addresses of all running instances in the
+// given ASG, excluding selfIP.
+func getASGPeerIPs(ctx context.Context, region, asgName string, selfIP net.IP) ([]net.IP, error) {
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
 	if err != nil {
 		return nil, err
 	}
 	client := ec2svc.NewFromConfig(awsCfg, func(o *ec2svc.Options) {
 		o.EndpointOptions.UseDualStackEndpoint = aws.DualStackEndpointStateEnabled
 	})
-	return &ec2PeerFinder{
-		onChange: make(chan struct{}, 1),
-		secret:   sha256.Sum256([]byte(secret)),
-		ec2:      client,
-		asgName:  asgName,
-		zoneName: zoneName,
-		scheme:   scheme,
-		nodeURL:  nodeURL,
-	}, nil
-}
-
-func (f *ec2PeerFinder) Node() *url.URL {
-	return f.nodeURL
-}
-
-func (f *ec2PeerFinder) Peers() []*url.URL {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.peers
-}
-
-// OnChange returns a channel that receives an empty signal whenever the set of
-// running ASG instances changes. The channel has a buffer of 1; if the consumer
-// is slow, intermediate signals are dropped (the consumer calls Peers() for the
-// authoritative current list).
-func (f *ec2PeerFinder) OnChange() <-chan struct{} { return f.onChange }
-
-func (f *ec2PeerFinder) refresh(ctx context.Context) {
-	out, err := f.ec2.DescribeInstances(ctx, &ec2svc.DescribeInstancesInput{
+	out, err := client.DescribeInstances(ctx, &ec2svc.DescribeInstancesInput{
 		Filters: []types.Filter{
-			{Name: aws.String("tag:aws:autoscaling:groupName"), Values: []string{f.asgName}},
+			{Name: aws.String("tag:aws:autoscaling:groupName"), Values: []string{asgName}},
 			{Name: aws.String("instance-state-name"), Values: []string{"running"}},
 		},
 	})
 	if err != nil {
-		log.Printf("peer refresh: 2describe instances: %v", err)
-		return
+		return nil, err
 	}
-
-	var peers []*url.URL
+	var peers []net.IP
 	for _, r := range out.Reservations {
 		for _, inst := range r.Instances {
 			ip, err := instanceIP(inst)
-			if err != nil {
-				log.Printf("peer refresh: instance %s: %v", aws.ToString(inst.InstanceId), err)
+			if err != nil || ip == nil || ip.Equal(selfIP) {
 				continue
 			}
-			if ip == nil {
-				continue
-			}
-			u, err := ipNodeURL(ip, f.zoneName, f.scheme)
-			if err != nil {
-				log.Printf("peer refresh: instance %s: build URL: %v", aws.ToString(inst.InstanceId), err)
-				continue
-			}
-			peers = append(peers, u)
+			peers = append(peers, ip)
 		}
 	}
-	slices.SortFunc(peers, func(a, b *url.URL) int { return strings.Compare(a.Host, b.Host) })
-
-	f.mu.Lock()
-	changed := !slices.EqualFunc(f.peers, peers, func(a, b *url.URL) bool { return a.Host == b.Host })
-	f.peers = peers
-	f.mu.Unlock()
-
-	log.Printf("peers refreshed: %v", peers)
-	if changed {
-		// Non-blocking send: if the buffer is full the consumer hasn't processed
-		// the last notification yet; it will call Peers() when it does.
-		select {
-		case f.onChange <- struct{}{}:
-		default:
-		}
-	}
-}
-
-func (f *ec2PeerFinder) start(ctx context.Context) {
-	f.refresh(ctx)
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(30 * time.Second):
-				f.refresh(ctx)
-			}
-		}
-	}()
-}
-
-func (f *ec2PeerFinder) Secret() [32]byte {
-	return f.secret
+	return peers, nil
 }
 
 // instanceIP returns the first public IPv6 address on the instance, preferring
@@ -372,18 +372,7 @@ func instanceIP(inst types.Instance) (net.IP, error) {
 	return nil, nil
 }
 
-// ipNodeURL derives a stable node base URL from a public IPv6 address.
-// The first 4 bytes of SHA-256(canonical IP string) become an 8-char hex
-// prefix, matching the hash used by the Cloudflare registration Lambda.
-func ipNodeURL(ip net.IP, zoneName, scheme string) (*url.URL, error) {
-	h := sha256.Sum256([]byte(ip.String()))
-	return url.Parse(fmt.Sprintf("%s://node-%s.%s", scheme, hex.EncodeToString(h[:4]), zoneName))
-}
-
-// selfNodeURL finds this node's base URL by scanning local network interfaces
-// for a public IPv6 address and deriving the URL via ipNodeURL. Interfaces are
-// iterated in system order; the first usable address wins. Returns nil, nil if
-// no suitable address is found.
+// getPublicIP finds the first public IPv6 address on any up, non-loopback interface.
 func getPublicIP() (net.IP, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -405,21 +394,16 @@ func getPublicIP() (net.IP, error) {
 			case *net.IPAddr:
 				ip = v.IP
 			}
-			// IPv6 only: To4() returns non-nil for IPv4 and IPv4-mapped addresses.
 			if ip == nil || ip.To4() != nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
 				continue
 			}
-
 			return ip, nil
 		}
 	}
 	return nil, nil
 }
 
-// detectRegion returns the AWS region for this instance. It checks the
-// AWS_REGION and AWS_DEFAULT_REGION environment variables first, then falls
-// back to querying IMDS. Returns an empty string if neither is available
-// (e.g. local dev without AWS credentials).
+// detectRegion returns the AWS region. Checks env vars first, then IMDS.
 func detectRegion(ctx context.Context) (string, error) {
 	for _, env := range []string{"AWS_REGION", "AWS_DEFAULT_REGION"} {
 		if r := os.Getenv(env); r != "" {
@@ -430,10 +414,8 @@ func detectRegion(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("querying IMDS for region: %w", err)
 	}
-
 	if out == nil {
 		return "", fmt.Errorf("no region found")
 	}
-
 	return out.Region, nil
 }

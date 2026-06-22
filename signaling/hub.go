@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-// hub manages live SSE connections keyed by base32 public key.
-// At most one connection per key is kept; registering a second closes the first.
+// hub manages live SSE connections keyed by base64url public key.
+// At most one connection per key; registering a second closes the first.
 //
 // sync.Map is used because the access pattern is write-once-per-connection,
 // read-many-per-message — exactly the case sync.Map's lock-free read path
@@ -23,44 +23,13 @@ type conn struct {
 	nc net.Conn
 }
 
-// newHub creates a hub and starts a single shared keepalive ticker that sends
-// SSE keep-alive comments to all active connections. The ticker runs until ctx
-// is cancelled, at which point all connections are closed.
-func newHub(ctx context.Context, peerFinder PeerFinder) *hub {
+// newHub creates a hub and starts the shared keepalive goroutine.
+func newHub(ctx context.Context) *hub {
 	h := &hub{}
-	go h.cleanUnownedConnections(ctx, peerFinder)
 	go h.keepalive(ctx)
 	return h
 }
 
-func (h *hub) cleanUnownedConnections(ctx context.Context, peerFinder PeerFinder) {
-	if peerFinder == nil {
-		return
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case _, ok := <-peerFinder.OnChange():
-			if !ok {
-				return
-			}
-
-			thisNode := peerFinder.Node()
-			h.clients.Range(func(k, val any) bool {
-				pubkey := k.(string)
-				target := targetPeer(peerFinder, pubkey)
-				if target == nil || target.Host != thisNode.Host {
-					c := val.(*conn)
-					if h.clients.CompareAndDelete(k, c) {
-						c.nc.Close()
-					}
-				}
-				return true
-			})
-		}
-	}
-}
 func (h *hub) keepalive(ctx context.Context) {
 	tick := time.NewTicker(20 * time.Second)
 	defer tick.Stop()

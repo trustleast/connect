@@ -1,5 +1,11 @@
 variable "availability_zones" {
-  type = list(string)
+  type        = list(string)
+  description = "AZs to create VPC subnets in. Must contain at least asg_az_index + 1 entries."
+}
+
+variable "asg_availability_zone" {
+  type        = string
+  description = "AZ name the ASG launches into (must be one of availability_zones), e.g. \"us-east-1a\"."
 }
 
 variable "stage" {

@@ -3,9 +3,10 @@ variable "vpc_id" {
   nullable = false
 }
 
-variable "subnets" {
-  type     = set(string)
-  nullable = false
+variable "subnet_id" {
+  type        = string
+  nullable    = false
+  description = "Single subnet ID the ASG launches into. Change this to move the ASG to a different AZ."
 }
 
 variable "name" {
