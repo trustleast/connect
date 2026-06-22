@@ -59,7 +59,10 @@ func run(ctx context.Context) error {
 	}
 
 	fmt.Println("Listening on:", *network, *addr)
-	srv := connect.NewHTTPServer(ctx, pp)
+	srv, err := connect.NewHTTPServer(ctx, pp)
+	if err != nil {
+		return err
+	}
 	return srv.Serve(ln)
 }
 
@@ -72,7 +75,7 @@ type staticPeerProvider struct {
 	onChange   chan struct{}
 }
 
-func (p *staticPeerProvider) Self() string             { return p.proxyURL }
-func (p *staticPeerProvider) GossipAddr() string       { return p.gossipAddr }
-func (p *staticPeerProvider) Peers() []*net.UDPAddr    { return p.peers }
+func (p *staticPeerProvider) Self() string              { return p.proxyURL }
+func (p *staticPeerProvider) GossipAddr() string        { return p.gossipAddr }
+func (p *staticPeerProvider) Peers() []*net.UDPAddr     { return p.peers }
 func (p *staticPeerProvider) OnChange() <-chan struct{} { return p.onChange }

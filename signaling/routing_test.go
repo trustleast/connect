@@ -28,7 +28,9 @@ func assertEqual[T comparable](t testing.TB, got T, expected T) {
 
 // TestSingleNode verifies that a server with no Gossip serves all requests locally.
 func TestSingleNode(t *testing.T) {
-	srv := httptest.NewServer(newServer(t.Context(), nil))
+	s, err := newServer(t.Context(), nil)
+	assertEqual(t, err, nil)
+	srv := httptest.NewServer(s)
 	defer srv.Close()
 
 	pub, _, err := ed25519.GenerateKey(nil)
@@ -53,12 +55,15 @@ func TestSingleNode(t *testing.T) {
 // to the peer node that holds the SSE stream.
 func TestProxyOnMiss(t *testing.T) {
 	// Node B holds the SSE stream.
-	nodeB := httptest.NewServer(newServer(t.Context(), nil))
+	s, err := newServer(t.Context(), nil)
+	assertEqual(t, err, nil)
+	nodeB := httptest.NewServer(s)
 	defer nodeB.Close()
 
 	// Node A is started with a PeerProvider; gossip is created internally.
 	pp := newTestPeerProvider()
-	sA := newServer(t.Context(), pp)
+	sA, err := newServer(t.Context(), pp)
+	assertEqual(t, err, nil)
 	nodeA := httptest.NewServer(sA)
 	defer nodeA.Close()
 
@@ -101,7 +106,8 @@ func TestProxyOnMiss(t *testing.T) {
 // is never re-proxied on a miss, and returns 404 instead.
 func TestProxyLoopPrevention(t *testing.T) {
 	pp := newTestPeerProvider()
-	s := newServer(t.Context(), pp)
+	s, err := newServer(t.Context(), pp)
+	assertEqual(t, err, nil)
 	srv := httptest.NewServer(s)
 	defer srv.Close()
 

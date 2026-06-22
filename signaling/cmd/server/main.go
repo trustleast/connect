@@ -12,8 +12,8 @@ import (
 	"net"
 	"os"
 	"slices"
-	"sync"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -151,8 +151,8 @@ type ec2PeerProvider struct {
 	onChange chan struct{}
 }
 
-func (p *ec2PeerProvider) Self() string             { return p.proxyURL }
-func (p *ec2PeerProvider) GossipAddr() string       { return p.gossipAddr }
+func (p *ec2PeerProvider) Self() string              { return p.proxyURL }
+func (p *ec2PeerProvider) GossipAddr() string        { return p.gossipAddr }
 func (p *ec2PeerProvider) OnChange() <-chan struct{} { return p.onChange }
 
 func (p *ec2PeerProvider) Peers() []*net.UDPAddr {
@@ -259,7 +259,10 @@ func run(ctx context.Context) error {
 		ln = tls.NewListener(ln, tlsCfg)
 	}
 
-	srv := connect.NewHTTPServer(ctx, pp)
+	srv, err := connect.NewHTTPServer(ctx, pp)
+	if err != nil {
+		return err
+	}
 	return srv.Serve(ln)
 }
 

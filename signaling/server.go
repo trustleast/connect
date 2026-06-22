@@ -74,8 +74,11 @@ type server struct {
 	authMsgPool    sync.Pool
 }
 
-func NewHTTPServer(ctx context.Context, pp PeerProvider) *http.Server {
-	s := newServer(ctx, pp)
+func NewHTTPServer(ctx context.Context, pp PeerProvider) (*http.Server, error) {
+	s, err := newServer(ctx, pp)
+	if err != nil {
+		return nil, err
+	}
 	return &http.Server{
 		Handler: s,
 		// Disable HTTP/2: ServeTLS enables it automatically via ALPN, but
@@ -86,14 +89,19 @@ func NewHTTPServer(ctx context.Context, pp PeerProvider) *http.Server {
 		WriteTimeout:      0,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1 << 10,
-	}
+	}, nil
 }
 
-func newServer(ctx context.Context, pp PeerProvider) *server {
+func newServer(ctx context.Context, pp PeerProvider) (*server, error) {
 	h := newHub(ctx)
 	var g *gossip
 	if pp != nil {
-		g = newGossip(ctx, pp, h)
+		var err error
+		g, err = newGossip(pp, h)
+		if err != nil {
+			return nil, err
+		}
+		g.listen(ctx)
 	}
 	return &server{
 		hub:    h,
@@ -121,7 +129,7 @@ func newServer(ctx context.Context, pp PeerProvider) *server {
 				return &b
 			},
 		},
-	}
+	}, nil
 }
 
 // ServeHTTP routes:

@@ -11,7 +11,9 @@ import (
 )
 
 func TestEndToEnd(t *testing.T) {
-	srv := httptest.NewServer(newServer(t.Context(), nil))
+	s, err := newServer(t.Context(), nil)
+	assertEqual(t, err, nil)
+	srv := httptest.NewServer(s)
 	defer srv.Close()
 
 	receiverPub, receiverPriv, err := ed25519.GenerateKey(nil)
