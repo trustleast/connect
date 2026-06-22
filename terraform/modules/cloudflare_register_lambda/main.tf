@@ -84,7 +84,6 @@ resource "aws_lambda_function" "registrar" {
   environment {
     variables = {
       CF_ZONE_ID            = var.cloudflare_zone_id
-      CF_ZONE_NAME          = join(".", slice(split(".", var.domain), 1, length(split(".", var.domain))))
       CF_DOMAIN             = var.domain
       CF_API_TOKEN_SSM_PATH = var.cf_api_token_ssm_path
     }

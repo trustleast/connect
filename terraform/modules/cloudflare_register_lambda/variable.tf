@@ -14,7 +14,7 @@ variable "cloudflare_api_token" {
 
 variable "domain" {
   type        = string
-  description = "Base domain for signaling (e.g. signaling.example.com). Node records are created as node-{id}.{domain}."
+  description = "Signaling domain (e.g. signaling.example.com). All active node IPs are registered under this single domain."
 }
 
 variable "cf_api_token_ssm_path" {
