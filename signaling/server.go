@@ -18,17 +18,18 @@ import (
 )
 
 // PeerProvider supplies intra-AZ peer discovery for the gossip routing layer.
-// NewHTTPServer uses it to bootstrap and track the gossip peer set; the gossip
+// NewServers uses it to bootstrap and track the gossip peer set; the gossip
 // protocol is an internal implementation detail of the server.
 //
 // Implementations must be safe for concurrent use.
 type PeerProvider interface {
-	// Self returns the internal HTTP base URL that peers use when proxying POSTs.
+	// Self returns this node's public HTTP base URL used by peers when proxying POSTs.
 	Self() string
-	// GossipAddr returns the UDP address this node listens on for gossip (e.g. ":9876").
+	// GossipAddr returns the TCP address to bind the internal gossip listener (e.g. ":9876").
 	GossipAddr() string
-	// Peers returns the current set of peer gossip UDP addresses (excluding self).
-	Peers() []*net.UDPAddr
+	// Peers returns the current set of peer internal gossip base URLs (excluding self),
+	// e.g. "http://[2001:db8::1]:9876".
+	Peers() []string
 	// OnChange returns a channel that receives a signal whenever the peer set
 	// changes. The channel must never be closed. Callers re-read Peers() after
 	// receiving a signal.
@@ -74,12 +75,22 @@ type server struct {
 	authMsgPool    sync.Pool
 }
 
-func NewHTTPServer(ctx context.Context, pp PeerProvider) (*http.Server, error) {
-	s, err := newServer(ctx, pp)
-	if err != nil {
-		return nil, err
-	}
-	return &http.Server{
+// Servers holds the public-facing and internal gossip HTTP servers.
+type Servers struct {
+	// Public handles client SSE connections and POST relay.
+	Public *http.Server
+	// Gossip handles intra-node gossip on the internal listener.
+	// Nil when no PeerProvider is configured (single-node mode).
+	Gossip *http.Server
+}
+
+// NewServers constructs the public and gossip HTTP servers.
+// When pp is nil the server runs in single-node mode and Gossip is nil.
+// Serve Public on the public listener (optionally wrapped with TLS) and
+// Gossip on a separate internal-only listener bound to pp.GossipAddr().
+func NewServers(ctx context.Context, pp PeerProvider) *Servers {
+	s := newServer(ctx, pp)
+	public := &http.Server{
 		Handler: s,
 		// Disable HTTP/2: ServeTLS enables it automatically via ALPN, but
 		// hijacking (required for SSE) is not available on HTTP/2 streams.
@@ -89,19 +100,25 @@ func NewHTTPServer(ctx context.Context, pp PeerProvider) (*http.Server, error) {
 		WriteTimeout:      0,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1 << 10,
-	}, nil
+	}
+	var gossipSrv *http.Server
+	if s.gossip != nil {
+		gossipSrv = &http.Server{
+			Handler:           s.gossip,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       10 * time.Second,
+			WriteTimeout:      5 * time.Second,
+			MaxHeaderBytes:    4 << 10,
+		}
+	}
+	return &Servers{Public: public, Gossip: gossipSrv}
 }
 
-func newServer(ctx context.Context, pp PeerProvider) (*server, error) {
+func newServer(ctx context.Context, pp PeerProvider) *server {
 	h := newHub(ctx)
 	var g *gossip
 	if pp != nil {
-		var err error
-		g, err = newGossip(pp, h)
-		if err != nil {
-			return nil, err
-		}
-		g.listen(ctx)
+		g = newGossip(ctx, pp, h)
 	}
 	return &server{
 		hub:    h,
@@ -129,7 +146,7 @@ func newServer(ctx context.Context, pp PeerProvider) (*server, error) {
 				return &b
 			},
 		},
-	}, nil
+	}
 }
 
 // ServeHTTP routes:

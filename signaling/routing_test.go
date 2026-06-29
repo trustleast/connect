@@ -28,9 +28,7 @@ func assertEqual[T comparable](t testing.TB, got T, expected T) {
 
 // TestSingleNode verifies that a server with no Gossip serves all requests locally.
 func TestSingleNode(t *testing.T) {
-	s, err := newServer(t.Context(), nil)
-	assertEqual(t, err, nil)
-	srv := httptest.NewServer(s)
+	srv := httptest.NewServer(newServer(t.Context(), nil))
 	defer srv.Close()
 
 	pub, _, err := ed25519.GenerateKey(nil)
@@ -55,15 +53,12 @@ func TestSingleNode(t *testing.T) {
 // to the peer node that holds the SSE stream.
 func TestProxyOnMiss(t *testing.T) {
 	// Node B holds the SSE stream.
-	s, err := newServer(t.Context(), nil)
-	assertEqual(t, err, nil)
-	nodeB := httptest.NewServer(s)
+	nodeB := httptest.NewServer(newServer(t.Context(), nil))
 	defer nodeB.Close()
 
 	// Node A is started with a PeerProvider; gossip is created internally.
 	pp := newTestPeerProvider()
-	sA, err := newServer(t.Context(), pp)
-	assertEqual(t, err, nil)
+	sA := newServer(t.Context(), pp)
 	nodeA := httptest.NewServer(sA)
 	defer nodeA.Close()
 
@@ -77,9 +72,6 @@ func TestProxyOnMiss(t *testing.T) {
 	pubStr := base64.RawURLEncoding.EncodeToString(pub)
 
 	// Inject peer state into nodeA's gossip so it knows nodeB claims this key.
-	if sA.gossip == nil {
-		t.Skip("gossip not available (UDP bind failed)")
-	}
 	sA.gossip.injectPeer(pubStr, nodeB.URL)
 
 	// POST to nodeA — it should proxy to nodeB and deliver.
@@ -106,14 +98,9 @@ func TestProxyOnMiss(t *testing.T) {
 // is never re-proxied on a miss, and returns 404 instead.
 func TestProxyLoopPrevention(t *testing.T) {
 	pp := newTestPeerProvider()
-	s, err := newServer(t.Context(), pp)
-	assertEqual(t, err, nil)
+	s := newServer(t.Context(), pp)
 	srv := httptest.NewServer(s)
 	defer srv.Close()
-
-	if s.gossip == nil {
-		t.Skip("gossip not available (UDP bind failed)")
-	}
 
 	_, priv, err := ed25519.GenerateKey(nil)
 	assertEqual(t, err, nil)

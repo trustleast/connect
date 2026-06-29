@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"slices"
 	"strings"
@@ -33,8 +34,8 @@ type serverConfig struct {
 	Addr       string
 	Network    string
 	AWSRegion  string
-	GossipAddr string // UDP listen address for intra-AZ gossip
-	GossipPort string // gossip UDP port on peer nodes
+	GossipAddr string // TCP listen address for the internal gossip server (e.g. ":9876")
+	GossipPort string // gossip TCP port on peer nodes
 	ProxyURL   string // this node's internal HTTP base URL for peer proxying
 }
 
@@ -50,8 +51,8 @@ func getConfig(ctx context.Context) (serverConfig, error) {
 	addr := flag.String("addr", cfg.Addr, "listen address")
 	network := flag.String("network", cfg.Network, "listen network (tcp, tcp4, tcp6)")
 	configS3 := flag.String("config-s3", "", "S3 URI for JSON instance config, e.g. s3://bucket/key")
-	gossipAddr := flag.String("gossip-addr", cfg.GossipAddr, "UDP address for intra-AZ gossip")
-	gossipPort := flag.String("gossip-port", cfg.GossipPort, "UDP port on peer nodes for gossip")
+	gossipAddr := flag.String("gossip-addr", cfg.GossipAddr, "TCP listen address for internal gossip server")
+	gossipPort := flag.String("gossip-port", cfg.GossipPort, "gossip TCP port on peer nodes")
 	proxyURL := flag.String("proxy-url", "", "this node's internal HTTP base URL for peer proxying")
 	flag.Parse()
 
@@ -121,15 +122,20 @@ func (cfg serverConfig) setupPeerProvider(ctx context.Context) (connect.PeerProv
 		o.EndpointOptions.UseDualStackEndpoint = aws.DualStackEndpointStateEnabled
 	})
 
+	gossipScheme := "http"
+	if cfg.Cert != "" {
+		gossipScheme = "https"
+	}
 	pp := &ec2PeerProvider{
-		proxyURL:   proxyURL,
-		gossipAddr: cfg.GossipAddr,
-		gossipPort: cfg.GossipPort,
-		asgName:    cfg.ASG,
-		region:     cfg.AWSRegion,
-		selfIP:     ip,
-		ec2:        ec2Client,
-		onChange:   make(chan struct{}, 1),
+		proxyURL:     proxyURL,
+		gossipAddr:   cfg.GossipAddr,
+		gossipPort:   cfg.GossipPort,
+		gossipScheme: gossipScheme,
+		asgName:      cfg.ASG,
+		region:       cfg.AWSRegion,
+		selfIP:       ip,
+		ec2:          ec2Client,
+		onChange:     make(chan struct{}, 1),
 	}
 	pp.start(ctx)
 	return pp, nil
@@ -138,24 +144,25 @@ func (cfg serverConfig) setupPeerProvider(ctx context.Context) (connect.PeerProv
 // ec2PeerProvider implements connect.PeerProvider by polling EC2 for running
 // instances in the same ASG.
 type ec2PeerProvider struct {
-	proxyURL   string
-	gossipAddr string
-	gossipPort string
-	asgName    string
-	region     string
-	selfIP     net.IP
-	ec2        *ec2svc.Client
+	proxyURL    string
+	gossipAddr  string
+	gossipPort  string
+	gossipScheme string // "http" or "https"
+	asgName     string
+	region      string
+	selfIP      net.IP
+	ec2         *ec2svc.Client
 
 	mu       sync.RWMutex
-	peers    []*net.UDPAddr
+	peers    []string
 	onChange chan struct{}
 }
 
 func (p *ec2PeerProvider) Self() string              { return p.proxyURL }
 func (p *ec2PeerProvider) GossipAddr() string        { return p.gossipAddr }
-func (p *ec2PeerProvider) OnChange() <-chan struct{} { return p.onChange }
+func (p *ec2PeerProvider) OnChange() <-chan struct{}  { return p.onChange }
 
-func (p *ec2PeerProvider) Peers() []*net.UDPAddr {
+func (p *ec2PeerProvider) Peers() []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.peers
@@ -167,18 +174,13 @@ func (p *ec2PeerProvider) refresh(ctx context.Context) {
 		log.Printf("peer refresh: %v", err)
 		return
 	}
-	peers := make([]*net.UDPAddr, 0, len(ips))
+	peers := make([]string, 0, len(ips))
 	for _, ip := range ips {
-		addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("[%s]:%s", ip, p.gossipPort))
-		if err != nil {
-			log.Printf("peer refresh: resolve %s: %v", ip, err)
-			continue
-		}
-		peers = append(peers, addr)
+		peers = append(peers, fmt.Sprintf("%s://[%s]:%s", p.gossipScheme, ip, p.gossipPort))
 	}
 
 	p.mu.Lock()
-	changed := !udpAddrsEqual(p.peers, peers)
+	changed := !stringSlicesEqual(p.peers, peers)
 	p.peers = peers
 	p.mu.Unlock()
 
@@ -206,18 +208,18 @@ func (p *ec2PeerProvider) start(ctx context.Context) {
 	}()
 }
 
-// udpAddrsEqual reports whether two slices contain the same addresses
-// (order-independent via string comparison after sorting).
-func udpAddrsEqual(a, b []*net.UDPAddr) bool {
+// stringSlicesEqual reports whether two slices contain the same strings
+// (order-independent).
+func stringSlicesEqual(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	set := make(map[string]struct{}, len(a))
-	for _, addr := range a {
-		set[addr.String()] = struct{}{}
+	for _, s := range a {
+		set[s] = struct{}{}
 	}
-	for _, addr := range b {
-		if _, ok := set[addr.String()]; !ok {
+	for _, s := range b {
+		if _, ok := set[s]; !ok {
 			return false
 		}
 	}
@@ -251,19 +253,33 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("listen %s %s: %w", cfg.Network, cfg.Addr, err)
 	}
 
+	var tlsCfg *tls.Config
 	if cfg.Cert != "" {
-		tlsCfg, err := buildTLS(cfg.Cert, cfg.Key)
+		tlsCfg, err = buildTLS(cfg.Cert, cfg.Key)
 		if err != nil {
 			return fmt.Errorf("building TLS config: %w", err)
 		}
 		ln = tls.NewListener(ln, tlsCfg)
 	}
 
-	srv, err := connect.NewHTTPServer(ctx, pp)
-	if err != nil {
-		return err
+	srvs := connect.NewServers(ctx, pp)
+
+	if srvs.Gossip != nil {
+		gossipLn, err := lc.Listen(ctx, "tcp", pp.GossipAddr())
+		if err != nil {
+			return fmt.Errorf("gossip listen %s: %w", pp.GossipAddr(), err)
+		}
+		if tlsCfg != nil {
+			gossipLn = tls.NewListener(gossipLn, tlsCfg)
+		}
+		go func() {
+			if err := srvs.Gossip.Serve(gossipLn); err != nil && err != http.ErrServerClosed {
+				log.Printf("gossip server: %v", err)
+			}
+		}()
 	}
-	return srv.Serve(ln)
+
+	return srvs.Public.Serve(ln)
 }
 
 func getS3Config(ctx context.Context, uri, region string, cfg *serverConfig) error {
