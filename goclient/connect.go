@@ -211,8 +211,14 @@ type Client struct {
 	api        *webrtc.API
 	opts       options
 	httpClient *http.Client
-	conns      sync.Map   // connKey → *connState
+	conns      sync.Map     // connKey → *connState
 	nodeToken  atomic.Value // string; set from raw token data line on SSE connect
+	// sseGate is held while there is no active SSE connection with a token.
+	// Listen locks it before the reconnect loop and connectSSE unlocks it after
+	// storing the token. connectSSE re-locks before returning so the next
+	// reconnect starts gated. Dial callers acquire+release to wait for an
+	// active connection.
+	sseGate sync.Mutex
 }
 
 func (c *Client) getNodeToken() string {
@@ -232,12 +238,12 @@ func (c *Client) getNodeToken() string {
 //
 // For inbound connections (created by handleOffer): authDone and offerSdp are
 // zero; no goroutine is waiting on auth. dialerToken holds the routing token
-// extracted from the offer, used as X-Node-Token on replies back to the dialer.
+// extracted from the offer, appended as ?t=<token> on replies back to the dialer.
 type connState struct {
 	pc          *webrtc.PeerConnection
 	authDone    chan error // buffered(1); nil for inbound connections
-	offerSdp    string    // set before conns.Store; empty for inbound connections
-	dialerToken string    // routing token from offer; empty for outbound connections
+	offerSdp    string     // set before conns.Store; empty for inbound connections
+	dialerToken string     // routing token from offer; empty for outbound connections
 }
 
 // sendAuth signals the auth channel if set. Non-blocking: if a prior signal
@@ -298,13 +304,15 @@ func New(optFuncs ...Option) (*Client, error) {
 	if opts.SettingEngine != nil {
 		api = webrtc.NewAPI(webrtc.WithSettingEngine(*opts.SettingEngine))
 	}
-	return &Client{
+	c := &Client{
 		api:  api,
 		opts: opts,
 		httpClient: &http.Client{
 			Transport: &redirectCacheTransport{cache: make(map[string]redirectEntry)},
 		},
-	}, nil
+	}
+	c.sseGate.Lock() // held until connectSSE receives the first token
+	return c, nil
 }
 
 // Dial opens a connection to the peer identified by remotePubkey (base64url).
@@ -315,6 +323,16 @@ func New(optFuncs ...Option) (*Client, error) {
 func (c *Client) Dial(ctx context.Context, remotePubkey string, setup func(*webrtc.PeerConnection)) (*webrtc.PeerConnection, error) {
 	if setup == nil {
 		return nil, fmt.Errorf("a data channel or media track must be set up")
+	}
+
+	// Wait for an active SSE connection with a token before dialing.
+	// sseGate starts locked and connectSSE unlocks it once the token is stored.
+	c.sseGate.Lock()
+	//nolint:SA2001
+	c.sseGate.Unlock()
+
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
 
 	challenge := make([]byte, 32)
@@ -394,7 +412,7 @@ func (c *Client) closeConnWithError(key connKey, state *connState, err error) {
 // makePC creates a new PeerConnection and buffers ICE candidates until
 // releaseICE is called. Call releaseICE after the local description is set
 // and the offer/answer is sent to the remote peer. dialerToken is included
-// as X-Node-Token on outgoing ICE POST requests to route to the remote node.
+// as ?t=<token> on outgoing ICE POST requests to route to the remote node.
 func (c *Client) makePC(ctx context.Context, remotePubkey string, challenge []byte, dialerToken string) (*webrtc.PeerConnection, func(), error) {
 	pc, err := c.api.NewPeerConnection(c.opts.Configuration)
 	if err != nil {
@@ -406,7 +424,9 @@ func (c *Client) makePC(ctx context.Context, remotePubkey string, challenge []by
 	var pending []string
 
 	send := func(candidateJSON string) {
-		_ = c.postICE(ctx, remotePubkey, candidateJSON, challenge, dialerToken)
+		if err := c.postICE(ctx, remotePubkey, candidateJSON, challenge, dialerToken); err != nil {
+			fmt.Println("failed to post ICE candidate:", err)
+		}
 	}
 
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
@@ -446,7 +466,7 @@ func (c *Client) makePC(ctx context.Context, remotePubkey string, challenge []by
 
 // signAndSend signs the given payload with the client's private key and sends
 // the message. msg.Sig must be empty; it is filled in by this function.
-// nodeToken, if non-empty, is sent as X-Node-Token to route to the remote node.
+// nodeToken, if non-empty, is appended as ?t=<token> to route to the remote node.
 func (c *Client) signAndSend(ctx context.Context, remotePubkey string, payload []byte, msg wireMessage, nodeToken string) error {
 	msg.Sig = base64.RawURLEncoding.EncodeToString(ed25519.Sign(c.opts.PrivateKey, payload))
 	return c.send(ctx, remotePubkey, msg, nodeToken)
@@ -493,13 +513,14 @@ func (c *Client) send(ctx context.Context, remotePubkey string, msg wireMessage,
 	if c.opts.OnSignal != nil {
 		c.opts.OnSignal(SignalEvent{SignalOutboundPOST, remotePubkey, body})
 	}
+	url := c.opts.ServerURL + "/" + remotePubkey
+	if nodeToken != "" {
+		url += "?t=" + nodeToken
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.opts.ServerURL+"/"+remotePubkey, strings.NewReader(body))
+		url, strings.NewReader(body))
 	if err != nil {
 		return err
-	}
-	if nodeToken != "" {
-		req.Header.Set("X-Node-Token", nodeToken)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -562,6 +583,7 @@ func (c *Client) handleOffer(ctx context.Context, msg wireMessage, challenge []b
 		return
 	}
 	if err := c.postAnswer(ctx, msg.From, desc.SDP, challenge, msg.Data, msg.Token); err != nil {
+		fmt.Println("failed to post answer:", err)
 		pc.Close()
 		return
 	}
@@ -662,7 +684,19 @@ func (c *Client) Listen(ctx context.Context) error {
 
 // connectSSE opens one SSE connection and reads until it closes or ctx is
 // cancelled. Returns nil on clean close, error on failure.
+//
+// Assumes sseGate is locked on entry. Unlocks it after storing the token so
+// Dial callers can proceed, then re-locks before returning so the next
+// reconnect attempt starts gated. If the connection fails before the token
+// is received, sseGate remains locked throughout.
 func (c *Client) connectSSE(ctx context.Context, path string) error {
+	unlocked := false
+	defer func() {
+		if unlocked {
+			// re-arm for next reconnect
+			c.sseGate.Lock()
+		}
+	}()
 	tsBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(tsBytes, uint64(time.Now().Unix()))
 	sig := ed25519.Sign(c.opts.PrivateKey, ssePayload(tsBytes))
@@ -686,12 +720,20 @@ func (c *Client) connectSSE(ctx context.Context, path string) error {
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
+	firstData := true
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
 		payload := line[len("data: "):]
+		if firstData {
+			firstData = false
+			c.nodeToken.Store(payload)
+			unlocked = true
+			c.sseGate.Unlock()
+			continue
+		}
 		if c.opts.OnSignal != nil {
 			c.opts.OnSignal(SignalEvent{SignalInboundSSE, c.Pubkey(), payload})
 		}
@@ -709,8 +751,6 @@ func (c *Client) handleSSEMessage(ctx context.Context, line string) error {
 	}
 	var msg wireMessage
 	if err := json.Unmarshal(raw, &msg); err != nil {
-		// Not a JSON wire message — treat as raw node routing token.
-		c.nodeToken.Store(line)
 		return nil
 	}
 	if msg.From == "" || msg.Data == "" || msg.Challenge == "" || msg.Sig == "" {

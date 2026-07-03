@@ -13,14 +13,18 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/pion/webrtc/v4"
 	connect "github.com/trustleast/connect/goclient"
 )
+
+const _PropagationDelay = 5 * time.Second
 
 // ---------------------------------------------------------------------------
 // Trial result types
@@ -211,6 +215,7 @@ func main() {
 func run() error {
 	verbose := flag.Bool("verbose", false, "add more verbose logging")
 	serverURL := flag.String("server-url", "", "connect relay URL")
+	provideServerURL := flag.String("provide-server-url", "", "connect relay URL")
 	trialTimeout := flag.Duration("timeout", 30*time.Second, "per-trial timeout")
 	dialTimeout := flag.Duration("dial-timeout", 10*time.Second, "per-dial signaling timeout")
 	privateKeyFlag := flag.String("private-key", "", "base64url-encoded ed25519 private key (32-byte seed or 64-byte key); generates a new key if not set")
@@ -230,6 +235,17 @@ func run() error {
 		ctx, cancel = context.WithTimeout(context.Background(), *trialTimeout)
 	}
 	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		select {
+		case <-sigCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
 	bus := newSignalBus(!*verbose)
 	results := make(chan trial, 64)
@@ -279,13 +295,24 @@ func run() error {
 
 	listenErr := make(chan error, 1)
 	go func() { listenErr <- client.Listen(ctx) }()
+	// Wait until we are propagated across the network
+	time.Sleep(_PropagationDelay)
 
 	if !*continuous {
 		candidateCmd := flag.Args()
 		if len(candidateCmd) == 0 {
 			return fmt.Errorf("usage: spec-tester [flags] -- candidate-command [args...]\n       or: spec-tester -continuous [flags]")
 		}
-		go runCandidateCommand(ctx, *serverURL, client.Pubkey())
+		candidateServerURL := *serverURL
+		if *provideServerURL != "" {
+			candidateServerURL = *provideServerURL
+		}
+		go func() {
+			if err := runCandidateCommand(ctx, candidateServerURL, client.Pubkey()); err != nil {
+				fmt.Printf("candidate command failed: %v\n", err)
+				cancel()
+			}
+		}()
 	}
 
 	once := true
@@ -295,6 +322,9 @@ func run() error {
 		case err := <-listenErr:
 			return fmt.Errorf("listen failed: %w", err)
 		case <-ctx.Done():
+			if ctx.Err() == context.DeadlineExceeded || ctx.Err() == context.Canceled {
+				return fail("trial.failed", "%v", ctx.Err().Error())
+			}
 			return nil
 		case t := <-results:
 			printTrial(t)
@@ -310,6 +340,10 @@ func runCandidateCommand(ctx context.Context, serverURL string, pubkey string) e
 	}
 	candidateArgs := append(candidateCmd[1:], serverURL, pubkey)
 	cmd := exec.CommandContext(ctx, candidateCmd[0], candidateArgs...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -345,7 +379,7 @@ func handleIncoming(ctx context.Context, client *connect.Client, bus *signalBus,
 	defer dialCancel()
 
 	outboundPongDone := make(chan error, 1)
-	outPC, err := client.Dial(dialCtx, remotePubkey, func(pc *webrtc.PeerConnection) {
+	setupConn := func(pc *webrtc.PeerConnection) {
 		lbl, err := randomChannelLabel()
 		if err != nil {
 			outboundPongDone <- err
@@ -360,7 +394,16 @@ func handleIncoming(ctx context.Context, client *connect.Client, bus *signalBus,
 			return
 		}
 		wireChallenge(dc, outboundPongDone, verbose)
-	})
+	}
+
+	// Wait 5 seconds before we respond to make sure our client can be reached back without tokens
+	time.Sleep(_PropagationDelay)
+
+	if verbose {
+		fmt.Printf("Dialing back")
+	}
+
+	outPC, err := client.Dial(dialCtx, remotePubkey, setupConn)
 	t.record("outbound.dial", err)
 	if err != nil {
 		t.TimedOut = dialCtx.Err() != nil || ctx.Err() != nil

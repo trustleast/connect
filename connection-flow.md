@@ -11,22 +11,22 @@ sequenceDiagram
     %% ── SSE subscription ──────────────────────────────────────────────
     D->>S: GET /{dialer_pubkey}<br/>?sig=base64url( sign(privkey, "connect.sse.v1\0" ‖ ts[8]) ‖ ts[8] )
     S-->>D: 200 text/event-stream (open)
-    S-->>D: data: dialer_token  (raw node routing token, multi-node deployments only)
+    S-->>D: data: dialer_token  (node routing token: enables immediate routing before gossip propagates + breaks filter false-positive ties)
 
     A->>S: GET /{answerer_pubkey}<br/>?sig=base64url( sign(privkey, "connect.sse.v1\0" ‖ ts[8]) ‖ ts[8] )
     S-->>A: 200 text/event-stream (open)
-    S-->>A: data: answerer_token  (raw node routing token, multi-node deployments only)
+    S-->>A: data: answerer_token  (node routing token: enables immediate routing before gossip propagates + breaks filter false-positive ties)
 
     %% ── Dial ──────────────────────────────────────────────────────────
     note over D: pc = new RTCPeerConnection()<br/>challenge = crypto.random(32 bytes)<br/>ts = unix seconds as uint64 big-endian (8 bytes)<br/>pc.createOffer → setLocalDescription<br/>(offer SDP contains dialer's DTLS fingerprint)
 
-    D->>S: POST /{answerer_pubkey}<br/>body: base64url(JSON{<br/>  from:      dialer_pubkey,<br/>  data:      offer_sdp,<br/>  challenge: base64url(challenge[32]),<br/>  ts:        base64url(ts[8]),<br/>  sig:       base64url(sign(privkey,<br/>    "connect.offer.v1\0" ‖ challenge ‖ ts[8] ‖ answerer_pubkey[32] ‖ offer_sdp)),<br/>  token:     dialer_token  (omitted if not in a multi-node deployment)<br/>})
+    D->>S: POST /{answerer_pubkey}<br/>body: base64url(JSON{<br/>  from:      dialer_pubkey,<br/>  data:      offer_sdp,<br/>  challenge: base64url(challenge[32]),<br/>  ts:        base64url(ts[8]),<br/>  sig:       base64url(sign(privkey,<br/>    "connect.offer.v1\0" ‖ challenge ‖ ts[8] ‖ answerer_pubkey[32] ‖ offer_sdp)),<br/>  token:     dialer_token  (empty string in single-node deployments)<br/>})
     S-->>A: data: base64url(JSON{from, data, challenge, ts, sig, token?})
 
     %% ── Answer ────────────────────────────────────────────────────────
     note over A: 1. verify ts within ±30s window<br/>2. verify sig: "connect.offer.v1\0" ‖ challenge ‖ ts ‖ own_pubkey ‖ offer_sdp<br/>3. AcceptConnection(dialer_pubkey)? → false: drop silently<br/>4. pc = new RTCPeerConnection()<br/>5. pc.setRemoteDescription(offer)<br/>6. pc.createAnswer → setLocalDescription<br/>   (answer SDP contains answerer's DTLS fingerprint)<br/>7. ts_answer = unix seconds (8 bytes)<br/>8. onIncoming(pc, dialer_pubkey) — app wires handlers<br/>9. send answer
 
-    A->>S: POST /{dialer_pubkey}<br/>X-Node-Token: dialer_token  (if present in offer)<br/>body: base64url(JSON{<br/>  from:      answerer_pubkey,<br/>  data:      answer_sdp,<br/>  challenge: base64url(challenge[32]),<br/>  ts:        base64url(ts_answer[8]),<br/>  sig:       base64url(sign(privkey,<br/>    "connect.answer.v1\0" ‖ challenge ‖ ts_answer[8] ‖ offer_sdp ‖ "\x00" ‖ answer_sdp))<br/>})
+    A->>S: POST /{dialer_pubkey}<br/>?t=dialer_token  (if present in offer)<br/>body: base64url(JSON{<br/>  from:      answerer_pubkey,<br/>  data:      answer_sdp,<br/>  challenge: base64url(challenge[32]),<br/>  ts:        base64url(ts_answer[8]),<br/>  sig:       base64url(sign(privkey,<br/>    "connect.answer.v1\0" ‖ challenge ‖ ts_answer[8] ‖ offer_sdp ‖ "\x00" ‖ answer_sdp))<br/>})
     S-->>D: data: base64url(JSON{from, data, challenge, ts, sig})
 
     note over D: 1. verify challenge matches sent challenge<br/>2. verify ts_answer within ±30s window<br/>3. verify sig: "connect.answer.v1\0" ‖ challenge ‖ ts_answer ‖ pc.localDescription.sdp ‖ "\x00" ‖ answer_sdp<br/>4. failure → pc.close()<br/>5. pc.setRemoteDescription(answer)
@@ -38,7 +38,7 @@ sequenceDiagram
         note over A: verify sig: "connect.ice.v1\0" ‖ challenge ‖ data<br/>failure → pc.close()
         note over A: → pc.addIceCandidate
 
-        A->>S: POST /{dialer_pubkey}<br/>X-Node-Token: dialer_token  (if present in offer)<br/>body: base64url(JSON{<br/>  from:      answerer_pubkey,<br/>  data:      JSON(candidate),<br/>  challenge: base64url(challenge[32]),<br/>  sig:       base64url(sign(privkey,<br/>    "connect.ice.v1\0" ‖ challenge ‖ JSON(candidate)))<br/>})
+        A->>S: POST /{dialer_pubkey}<br/>?t=dialer_token  (if present in offer)<br/>body: base64url(JSON{<br/>  from:      answerer_pubkey,<br/>  data:      JSON(candidate),<br/>  challenge: base64url(challenge[32]),<br/>  sig:       base64url(sign(privkey,<br/>    "connect.ice.v1\0" ‖ challenge ‖ JSON(candidate)))<br/>})
         S-->>D: data: base64url(JSON{from, data, challenge, sig})
         note over D: verify sig: "connect.ice.v1\0" ‖ challenge ‖ data<br/>failure → pc.close()
         note over D: → pc.addIceCandidate
@@ -69,3 +69,5 @@ sequenceDiagram
 6. **Authorization callback** — after signature and timestamp verification, the answerer calls `AcceptConnection(dialer_pubkey)` before creating a PeerConnection or sending an answer. This gives the application control over who can initiate connections. Returning false drops the offer silently (no error response to the dialer) to avoid leaking information about whether the key is active.
 
 7. **Auth failure closes the PC** — any verification failure (invalid signature, wrong or missing challenge, stale timestamp, unacceptable pubkey) causes the library to call `pc.close()` immediately and discard the message. The application may observe the connection close if auth fails on a message received after `onIncoming` fires. `onIncoming` means "a valid authenticated offer arrived and an answer was sent" — not "a working P2P connection exists." The connection is established only after DTLS completes.
+
+8. **Node routing token** — in multi-node deployments, each SSE stream opens with a plain `data:` line carrying a routing token: `base64url(sha256(pubkey || node_proxy_url)[:8])`. The token is not signed and carries no identity claim — it is purely a routing hint. Including it in the offer's `token` field lets the answerer append it as `?t=<token>` on POST requests back to the dialer. This solves two problems: (1) gossip filters propagate every 5 seconds, so an answerer that tries to POST immediately after receiving an offer would miss the dialer's key in peer filters — the token lets the server route directly to the dialer's home node without waiting; (2) when multiple peers' probabilistic filters all report a false positive for a key, the token deterministically identifies the correct peer. The token is not part of any signed payload and a stale token (dialer reconnected to a different node) causes at most one failed proxy attempt before falling back to the gossip filter scan.

@@ -24,15 +24,22 @@ func TestEndToEnd(t *testing.T) {
 	sse := connectSSE(t, srv.URL, receiverPriv)
 	defer sse.Body.Close()
 
-	// Read the first data line from SSE in the background.
+	// Skip the first data line (node routing token); read the second (the message).
 	got := make(chan string, 1)
 	go func() {
 		s := bufio.NewScanner(sse.Body)
+		tokenSkipped := false
 		for s.Scan() {
-			if result, ok := strings.CutPrefix(s.Text(), "data: "); ok {
-				got <- result
-				return
+			result, ok := strings.CutPrefix(s.Text(), "data: ")
+			if !ok {
+				continue
 			}
+			if !tokenSkipped {
+				tokenSkipped = true
+				continue
+			}
+			got <- result
+			return
 		}
 		if err := s.Err(); err != nil {
 			t.Errorf("SSE read error: %v", err)

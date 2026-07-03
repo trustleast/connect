@@ -37,10 +37,7 @@ locals {
     ssh_pub_key   = var.ssh_pub_key
     region        = data.aws_region.current.region
     args = join(" ", [
-      "-addr", "[::]:443",
-      "-network", "tcp6",
       "-config-s3", "s3://${aws_s3_bucket.config.bucket}/config.json",
-      "-zone-name", var.zone_name,
     ])
   }))
 }
@@ -85,6 +82,9 @@ resource "aws_s3_object" "config" {
     Key           = base64encode(var.key_pem)
     ASG           = local.asg_name
     ClusterSecret = var.cluster_secret
+    Addr          = "[::]:443"
+    GossipAddr    = "[::]:9876"
+    Network       = "tcp6"
   })
 }
 

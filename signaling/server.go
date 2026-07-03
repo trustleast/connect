@@ -264,13 +264,16 @@ func (s *server) listenForMessages(w http.ResponseWriter, r *http.Request, pubke
 		return
 	}
 
+	token := ""
 	if s.gossip != nil {
-		token := s.gossip.tokenFor(pubkeyStr)
-		if _, err := nc.Write([]byte("data: " + token + "\n\n")); err != nil {
-			nc.Close()
-			return
-		}
+		token = s.gossip.tokenFor(pubkeyStr)
 	}
+	if _, err := nc.Write([]byte("data: " + token + "\n\n")); err != nil {
+		nc.Close()
+		return
+	}
+
+	fmt.Printf("Listening for %s with token %s from %s: %v\n", pubkeyStr, token, r.RemoteAddr, r.Header)
 
 	s.hub.register(pubkeyStr, nc)
 }
@@ -329,7 +332,7 @@ func (s *server) postMessage(w http.ResponseWriter, r *http.Request, targetStr s
 	// Local miss: proxy to a peer that claims this key if gossip is configured
 	// and this request has not already been proxied (prevent proxy loops).
 	if s.gossip != nil && r.Header.Get("X-Internal-Relay") == "" {
-		token := r.Header.Get("X-Node-Token")
+		token := r.URL.Query().Get("t")
 		if proxyURL, ok := s.gossip.findPeer(targetStr, token); ok {
 			s.proxyPost(w, r, proxyURL, targetStr, body[:n])
 			return
@@ -355,6 +358,7 @@ func (s *server) proxyPost(w http.ResponseWriter, r *http.Request, proxyBaseURL,
 		http.Error(w, "peer unreachable", http.StatusBadGateway)
 		return
 	}
-	resp.Body.Close()
 	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+	resp.Body.Close()
 }

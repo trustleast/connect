@@ -76,14 +76,22 @@ func TestProxyOnMiss(t *testing.T) {
 	sA.gossip.injectPeer(pubStr, nodeB.URL)
 
 	// POST to nodeA — it should proxy to nodeB and deliver.
+	// Skip the first data line (node routing token); the second is the message.
 	got := make(chan string, 1)
 	go func() {
 		s := bufio.NewScanner(sse.Body)
+		tokenSkipped := false
 		for s.Scan() {
-			if data, ok := strings.CutPrefix(s.Text(), "data: "); ok {
-				got <- data
-				return
+			data, ok := strings.CutPrefix(s.Text(), "data: ")
+			if !ok {
+				continue
 			}
+			if !tokenSkipped {
+				tokenSkipped = true
+				continue
+			}
+			got <- data
+			return
 		}
 	}()
 
@@ -117,7 +125,7 @@ func TestProxyLoopPrevention(t *testing.T) {
 	assertEqual(t, resp.StatusCode, http.StatusNotFound)
 }
 
-// TestTokenBypassGossip verifies that a POST with X-Node-Token routes directly
+// TestTokenBypassGossip verifies that a POST with ?t=<token> routes directly
 // to the correct peer without requiring a gossip filter entry. This covers the
 // window immediately after a client connects, before gossip has propagated.
 func TestTokenBypassGossip(t *testing.T) {
@@ -177,8 +185,7 @@ func TestTokenBypassGossip(t *testing.T) {
 	token := <-tokenCh
 
 	// POST to node A with the token — should route to node B without a filter.
-	req, _ := http.NewRequest(http.MethodPost, nodeA.URL+"/"+pubStr, bytes.NewReader(testSDP))
-	req.Header.Set("X-Node-Token", token)
+	req, _ := http.NewRequest(http.MethodPost, nodeA.URL+"/"+pubStr+"?t="+token, bytes.NewReader(testSDP))
 	resp, err := (&http.Client{}).Do(req)
 	assertEqual(t, err, nil)
 	resp.Body.Close()
@@ -188,7 +195,7 @@ func TestTokenBypassGossip(t *testing.T) {
 }
 
 // TestStaleTokenFallsBackToGossip verifies that a POST with an unrecognised
-// X-Node-Token still delivers via the gossip filter path.
+// wrong ?t= token still delivers via the gossip filter path.
 func TestStaleTokenFallsBackToGossip(t *testing.T) {
 	// Node B is single-node (no gossip) — only needs an SSE connection.
 	nodeB := httptest.NewServer(newServer(t.Context(), nil))
@@ -211,19 +218,26 @@ func TestStaleTokenFallsBackToGossip(t *testing.T) {
 	sA.gossip.injectPeer(pubStr, nodeB.URL)
 	wrongToken := nodeToken(pubStr, "http://some-other-node:8080")
 
+	// Skip the first data line (node routing token); the second is the message.
 	got := make(chan string, 1)
 	go func() {
 		s := bufio.NewScanner(sse.Body)
+		tokenSkipped := false
 		for s.Scan() {
-			if data, ok := strings.CutPrefix(s.Text(), "data: "); ok {
-				got <- data
-				return
+			data, ok := strings.CutPrefix(s.Text(), "data: ")
+			if !ok {
+				continue
 			}
+			if !tokenSkipped {
+				tokenSkipped = true
+				continue
+			}
+			got <- data
+			return
 		}
 	}()
 
-	req, _ := http.NewRequest(http.MethodPost, nodeA.URL+"/"+pubStr, bytes.NewReader(testSDP))
-	req.Header.Set("X-Node-Token", wrongToken)
+	req, _ := http.NewRequest(http.MethodPost, nodeA.URL+"/"+pubStr+"?t="+wrongToken, bytes.NewReader(testSDP))
 	resp, err := (&http.Client{}).Do(req)
 	assertEqual(t, err, nil)
 	resp.Body.Close()

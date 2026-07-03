@@ -35,7 +35,6 @@ type serverConfig struct {
 	Network    string
 	AWSRegion  string
 	GossipAddr string // TCP listen address for the internal gossip server (e.g. ":9876")
-	GossipPort string // gossip TCP port on peer nodes
 }
 
 func getConfig(ctx context.Context) (serverConfig, error) {
@@ -44,14 +43,12 @@ func getConfig(ctx context.Context) (serverConfig, error) {
 		Network:    "tcp",
 		AWSRegion:  "us-east-1",
 		GossipAddr: ":9876",
-		GossipPort: "9876",
 	}
 
 	addr := flag.String("addr", cfg.Addr, "listen address")
 	network := flag.String("network", cfg.Network, "listen network (tcp, tcp4, tcp6)")
 	configS3 := flag.String("config-s3", "", "S3 URI for JSON instance config, e.g. s3://bucket/key")
 	gossipAddr := flag.String("gossip-addr", cfg.GossipAddr, "TCP listen address for internal gossip server")
-	gossipPort := flag.String("gossip-port", cfg.GossipPort, "gossip TCP port on peer nodes")
 	flag.Parse()
 
 	region, err := detectRegion(ctx)
@@ -74,8 +71,6 @@ func getConfig(ctx context.Context) (serverConfig, error) {
 			cfg.Network = *network
 		case "gossip-addr":
 			cfg.GossipAddr = *gossipAddr
-		case "gossip-port":
-			cfg.GossipPort = *gossipPort
 		}
 	})
 
@@ -85,7 +80,7 @@ func getConfig(ctx context.Context) (serverConfig, error) {
 // setupPeerProvider builds an ec2PeerProvider if an ASG is configured.
 // Returns nil (single-node mode) when no ASG is set.
 func (cfg serverConfig) setupPeerProvider(ctx context.Context) (connect.PeerProvider, error) {
-	if cfg.ASG == "" {
+	if cfg.ASG == "" || cfg.GossipAddr == "" {
 		return nil, nil
 	}
 
@@ -101,11 +96,11 @@ func (cfg serverConfig) setupPeerProvider(ctx context.Context) (connect.PeerProv
 	if cfg.Cert == "" {
 		scheme = "http"
 	}
-	port := cfg.Addr
-	if i := strings.LastIndex(port, ":"); i >= 0 {
-		port = port[i:]
+	_, apiPort, err := net.SplitHostPort(cfg.Addr)
+	if err != nil {
+		return nil, err
 	}
-	proxyURL := fmt.Sprintf("%s://[%s]%s", scheme, ip.String(), port)
+	proxyURL := buildIPURL(scheme, ip, apiPort)
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.AWSRegion))
 	if err != nil {
@@ -115,21 +110,21 @@ func (cfg serverConfig) setupPeerProvider(ctx context.Context) (connect.PeerProv
 		o.EndpointOptions.UseDualStackEndpoint = aws.DualStackEndpointStateEnabled
 	})
 
-	gossipScheme := "http"
-	if cfg.Cert != "" {
-		gossipScheme = "https"
+	_, gossipPort, err := net.SplitHostPort(cfg.GossipAddr)
+	if err != nil {
+		return nil, err
 	}
+
 	pp := &ec2PeerProvider{
 		proxyURL:     proxyURL,
-		gossipAddr:   cfg.GossipAddr,
-		gossipPort:   cfg.GossipPort,
-		gossipScheme: gossipScheme,
 		asgName:      cfg.ASG,
 		region:       cfg.AWSRegion,
 		selfIP:       ip,
 		ec2:          ec2Client,
+		gossipPort:   gossipPort,
+		gossipScheme: scheme,
 	}
-	pp.start(ctx)
+	go pp.start(ctx)
 	return pp, nil
 }
 
@@ -137,13 +132,12 @@ func (cfg serverConfig) setupPeerProvider(ctx context.Context) (connect.PeerProv
 // instances in the same ASG.
 type ec2PeerProvider struct {
 	proxyURL     string
-	gossipAddr   string
-	gossipPort   string
-	gossipScheme string // "http" or "https"
 	asgName      string
 	region       string
 	selfIP       net.IP
 	ec2          *ec2svc.Client
+	gossipScheme string
+	gossipPort   string
 
 	mu    sync.RWMutex
 	peers []string
@@ -165,7 +159,7 @@ func (p *ec2PeerProvider) refresh(ctx context.Context) {
 	}
 	peers := make([]string, 0, len(ips))
 	for _, ip := range ips {
-		peers = append(peers, fmt.Sprintf("%s://[%s]:%s", p.gossipScheme, ip, p.gossipPort))
+		peers = append(peers, buildIPURL(p.gossipScheme, ip, p.gossipPort))
 	}
 
 	p.mu.Lock()
@@ -175,36 +169,16 @@ func (p *ec2PeerProvider) refresh(ctx context.Context) {
 
 func (p *ec2PeerProvider) start(ctx context.Context) {
 	p.refresh(ctx)
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				p.refresh(ctx)
-			}
-		}
-	}()
-}
-
-// stringSlicesEqual reports whether two slices contain the same strings
-// (order-independent).
-func stringSlicesEqual(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	set := make(map[string]struct{}, len(a))
-	for _, s := range a {
-		set[s] = struct{}{}
-	}
-	for _, s := range b {
-		if _, ok := set[s]; !ok {
-			return false
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.refresh(ctx)
 		}
 	}
-	return true
 }
 
 func main() {
@@ -418,4 +392,12 @@ func detectRegion(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("no region found")
 	}
 	return out.Region, nil
+}
+
+func buildIPURL(scheme string, ip net.IP, port string) string {
+	if ip.To4() == nil {
+		return fmt.Sprintf("%s://[%s]:%s", scheme, ip.String(), port)
+	}
+
+	return fmt.Sprintf("%s://%s:%s", scheme, ip.String(), port)
 }

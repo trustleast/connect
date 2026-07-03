@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net/http"
 	"sync"
@@ -26,6 +27,13 @@ type peerSnapshot struct {
 	filter *xorfilter.BinaryFuse[uint8]
 }
 
+// peerRange calls fn for every entry. Returning false stops iteration.
+func peerRange(m *sync.Map, fn func(proxyURL string, ps *peerSnapshot) bool) {
+	m.Range(func(k, v any) bool {
+		return fn(k.(string), v.(*peerSnapshot))
+	})
+}
+
 // gossip manages intra-AZ presence gossip over HTTP.
 //
 // Each node periodically POSTs a BinaryFuse[uint8] filter of its locally
@@ -38,16 +46,14 @@ type gossip struct {
 	pp     PeerProvider
 	client *http.Client
 
-	mu          sync.RWMutex
-	peerByProxy map[string]*peerSnapshot // keyed by sender's proxy URL (from X-Proxy-URL header)
+	peers sync.Map // *peerSnapshot, keyed by sender's proxy URL (from X-Proxy-URL header)
 }
 
 func newGossip(ctx context.Context, pp PeerProvider, h *hub) *gossip {
 	g := &gossip{
-		hub:         h,
-		pp:          pp,
-		client:      &http.Client{Timeout: 5 * time.Second},
-		peerByProxy: make(map[string]*peerSnapshot),
+		hub:    h,
+		pp:     pp,
+		client: &http.Client{Timeout: 5 * time.Second},
 	}
 	go g.periodicBroadcast(ctx)
 	return g
@@ -74,39 +80,44 @@ func (g *gossip) postTo(ctx context.Context, gossipBaseURL string, filterData []
 	if err != nil {
 		return
 	}
+	_, err = io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("Error posting to %s: %v\n", gossipBaseURL, err)
+	}
 }
 
 // ServeHTTP handles incoming gossip POSTs on the internal listener.
 // Only POST /gossip is accepted; everything else returns 404.
 func (g *gossip) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost || r.URL.Path != _GossipPath {
-		http.NotFound(w, r)
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
 	fromURL := r.Header.Get("X-Proxy-URL")
 	if fromURL == "" {
-		http.Error(w, "missing X-Proxy-URL header", http.StatusBadRequest)
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, _MaxGossipBody+1))
 	if err != nil {
-		http.Error(w, "read error", http.StatusBadRequest)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	if len(body) > _MaxGossipBody {
-		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
 		return
 	}
 
-	filter := deserializeFilter(body)
-	ts := time.Now()
+	filter, err := deserializeFilter(body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 
-	g.mu.Lock()
-	g.peerByProxy[fromURL] = &peerSnapshot{ts: ts, filter: filter}
-	g.mu.Unlock()
+	g.peers.Store(fromURL, &peerSnapshot{ts: time.Now(), filter: filter})
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -138,15 +149,14 @@ func (g *gossip) tokenFor(pubkey string) string {
 func (g *gossip) findPeer(pubkey, token string) (string, bool) {
 	h := pubkeyToUint64(pubkey)
 	deadline := time.Now().Add(-_PeerTimeout)
-	g.mu.RLock()
-	defer g.mu.RUnlock()
 	var bestURL string
 	var missingMatchURL string
 	var best *peerSnapshot
-	for proxyURL, ps := range g.peerByProxy {
-		if ps.ts.Before(deadline) || ps.filter == nil {
-			continue
-		}
+	g.peers.Range(func(key any, value any) bool {
+		proxyURL := key.(string)
+		ps := value.(*peerSnapshot)
+
+		fmt.Println("Trying peer", proxyURL, "for pubkey", pubkey, "with token", token, "and filter", ps.filter == nil)
 
 		// Store the missingMatchURL in case we have no candidates and fall back to that
 		tokenMatch := false
@@ -154,11 +164,17 @@ func (g *gossip) findPeer(pubkey, token string) (string, bool) {
 			tokenMatch = true
 			missingMatchURL = proxyURL
 		}
+
+		if ps.ts.Before(deadline) || ps.filter == nil {
+			return true
+		}
 		if ps.filter.Contains(h) {
 			// Token match wins immediately — prefer the authoritative node over
 			// the most-recently-seen heuristic when filters have false positives.
 			if tokenMatch {
-				return proxyURL, true
+				bestURL = proxyURL
+				best = ps
+				return false // stop iteration
 			}
 
 			if best == nil || ps.ts.After(best.ts) {
@@ -166,7 +182,8 @@ func (g *gossip) findPeer(pubkey, token string) (string, bool) {
 				bestURL = proxyURL
 			}
 		}
-	}
+		return true
+	})
 	if best == nil {
 		if missingMatchURL != "" {
 			return missingMatchURL, true
@@ -200,13 +217,9 @@ func serializeFilter(f *xorfilter.BinaryFuse[uint8]) []byte {
 	return buf.Bytes()
 }
 
-func deserializeFilter(data []byte) *xorfilter.BinaryFuse[uint8] {
+func deserializeFilter(data []byte) (*xorfilter.BinaryFuse[uint8], error) {
 	if len(data) == 0 {
-		return nil
+		return nil, nil
 	}
-	f, err := xorfilter.LoadBinaryFuse[uint8](bytes.NewReader(data))
-	if err != nil {
-		return nil
-	}
-	return f
+	return xorfilter.LoadBinaryFuse[uint8](bytes.NewReader(data))
 }

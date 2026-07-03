@@ -49,14 +49,93 @@ Cloudflare.
 
 ---
 
-## Core Rules
+## Intra-Cluster Routing (Implemented)
+
+Within a cluster, nodes route POSTs to each other via server-side HTTP proxy. There are no
+client-visible redirects within a cluster. Clients POST to any node and receive a 202 if
+delivered or a 404 if the target is not connected anywhere in the cluster.
+
+### Node Token
+
+Each node computes a deterministic routing token for each connected client:
 
 ```text
-node_id = hex(HMAC-SHA256(cluster_node_id_secret, node_public_key)[0:8])
-
-score(pubkey, peer) = hash64(pubkey || "\x00" || peer.node_id)
-owner                = peer with highest score
+node_token(pubkey, proxy_url) = base64url( sha256(pubkey || proxy_url)[:8] )
 ```
+
+The token is sent to the client as the first SSE data line immediately after the stream opens:
+
+```
+data: <token>\n\n
+```
+
+Clients include the token as the `token` field in offer wire messages (not signed — it is
+a routing hint, not an identity claim). The answerer appends it as `?t=<token>` on POST
+requests back to the dialer. The server uses it to locate the dialer's home node directly.
+
+`?t=<token>` solves two distinct problems:
+
+1. **Pre-gossip delivery** — gossip propagates every 5 seconds. A token lets a node route
+   a POST immediately after the dialer connects, before any broadcast has gone out. The
+   token identifies the home node even when no peer filter yet contains the key.
+
+2. **False-positive tie-breaking** — `BinaryFuse[uint8]` is probabilistic. When multiple
+   peers' filters claim a key, the token deterministically selects the correct peer instead
+   of falling back to a recency heuristic.
+
+In the future the same token mechanism can be extended for cross-region routing: a dialer's
+token encodes which node (and implicitly which region) they connected to, giving the answerer
+a direct routing hint across regions without a separate presence lookup.
+
+### Gossip
+
+Each node maintains a `BinaryFuse[uint8]` filter over its locally-connected SSE pubkeys.
+Every 5 seconds, the node POSTs the serialized filter to each known peer's `/gossip`
+endpoint. The sender identifies itself in the `X-Proxy-URL` request header. The receiver
+stores the snapshot keyed by that URL with a 30-second expiry.
+
+```
+POST /gossip HTTP/1.1
+X-Proxy-URL: https://[2001:db8::1]:8080
+Content-Type: application/octet-stream
+
+<serialized BinaryFuse[uint8]>
+```
+
+Peers are discovered via `PeerProvider.Peers()` (e.g. EC2 ASG polling every 30s).
+
+### POST Routing Within a Cluster
+
+On a local hub miss, the node runs the following lookup sequence:
+
+1. **Token fast path** — if `?t=<token>` is present, scan known peers for the one where
+   `node_token(pubkey, peer_url) == token`. Proxy to that peer if found. Does not require
+   the peer to have a filter.
+
+2. **Filter scan with token tie-breaker** — scan `peerByProxy` for peers whose filter
+   contains the pubkey. If the token matches a peer but its filter predates the connection
+   (key not yet included), that peer is still selected as a best-effort fallback
+   (`missingMatchURL`). Among filter matches, the most recently seen peer wins unless the
+   token identifies a specific one.
+
+3. **404** — if no peer claims the key.
+
+`X-Internal-Relay: 1` is set on proxied requests to prevent proxy loops; a node that
+receives a proxied request never re-proxies it.
+
+### Intra-Cluster Routing Rules
+
+| Request param/header | Behavior                                                                              |
+| -------------------- | ------------------------------------------------------------------------------------- |
+| `?t=<token>`         | Bypass filter scan; proxy to the matching peer's proxy URL                            |
+| `X-Internal-Relay`   | Already proxied; attempt local deliver only, return 404 on miss — never re-proxy      |
+| (none)               | Local deliver first; fall back to filter scan; 404 on total miss                      |
+
+---
+
+## Cross-Region Routing (Planned)
+
+The following architecture is the intended future state. It is not yet implemented.
 
 Hostnames carry the routing budget:
 
@@ -66,19 +145,12 @@ Hostnames carry the routing budget:
 | Own node host   | Arrived at intended node   | Normal lookup; deliver only if this node is still the target                           |
 | Other node host | DNS drain/failure fallback | Recompute current target; 307 if target differs, 404 if it points back to the bad host |
 
-Clients provide one routing hint: `X-Node-Token` on POST requests. This token is received as the first raw data line on the SSE stream and is included in offer bodies so that the answerer can attach it to replies. The server uses it to skip the gossip lookup and deliver directly to the target's home node. Absent the token, the server falls back to normal gossip-based routing.
-
 GET establishes where a pubkey listens. POST looks for the pubkey. Every POST checks
 the current region filter first:
 
-1. If the key is in this region, compute the current regional HRW node and 307 there.
-   If the request is already on that node hostname, deliver locally.
+1. If the key is in this region, proxy internally to the node that holds the connection.
 2. If the key is not in this region, 307 to the region selected by distributed presence.
 3. If a drained/stale hostname recomputes to itself, return 404 instead of looping.
-
-Any peer-set change triggers an SSE ownership sweep. A node closes local SSE streams for
-pubkeys whose HRW owner is no longer itself; clients reconnect through the normal GET
-flow and land on the new owner.
 
 ---
 

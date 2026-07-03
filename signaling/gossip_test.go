@@ -28,9 +28,8 @@ func (p *testPeerProvider) Peers() []string { return nil }
 // Useful for unit tests that only call injectPeer + findPeer directly.
 func newTestGossip() *gossip {
 	return &gossip{
-		pp:          newTestPeerProvider(),
-		hub:         newHub(context.Background()),
-		peerByProxy: make(map[string]*peerSnapshot),
+		pp:  newTestPeerProvider(),
+		hub: newHub(context.Background()),
 	}
 }
 
@@ -40,12 +39,7 @@ func (g *gossip) injectPeer(pubkey string, proxyURL string) {
 	if err != nil {
 		panic("injectPeer: filter build failed: " + err.Error())
 	}
-	g.mu.Lock()
-	g.peerByProxy[proxyURL] = &peerSnapshot{
-		ts:     time.Now(),
-		filter: f,
-	}
-	g.mu.Unlock()
+	g.peers.Store(proxyURL, &peerSnapshot{ts: time.Now(), filter: f})
 }
 
 // injectStaleFilter adds a peer entry whose filter was built before the target
@@ -60,9 +54,7 @@ func (g *gossip) injectStaleFilter(proxyURL string) {
 	if err != nil {
 		panic("injectStaleFilter: " + err.Error())
 	}
-	g.mu.Lock()
-	g.peerByProxy[proxyURL] = &peerSnapshot{ts: time.Now(), filter: f}
-	g.mu.Unlock()
+	g.peers.Store(proxyURL, &peerSnapshot{ts: time.Now(), filter: f})
 }
 
 // pubKeyStr encodes an ed25519 private key's public part as base64url.
@@ -156,11 +148,9 @@ func TestFindPeer_tokenTiebreaker(t *testing.T) {
 	assertEqual(t, err, nil)
 
 	now := time.Now()
-	g.mu.Lock()
 	// peer2 is more recent — it would win without a token.
-	g.peerByProxy["http://peer1:8080"] = &peerSnapshot{ts: now.Add(-time.Millisecond), filter: f}
-	g.peerByProxy["http://peer2:8080"] = &peerSnapshot{ts: now, filter: f}
-	g.mu.Unlock()
+	g.peers.Store("http://peer1:8080", &peerSnapshot{ts: now.Add(-time.Millisecond), filter: f})
+	g.peers.Store("http://peer2:8080", &peerSnapshot{ts: now, filter: f})
 
 	// Token identifies peer1; it should win despite being less recent.
 	token := nodeToken(pub, "http://peer1:8080")

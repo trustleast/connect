@@ -3,9 +3,16 @@
 > [!WARNING]
 > This project includes an experimental authentication flow for WebRTC signaling messages. It has not been professionally audited, formally verified, or battle-tested against real adversaries. Do not treat it as a security product. Review the design, read the code, run your own tests, and use it at your own risk.
 
-Connect is a small WebRTC signaling relay and matching client libraries. The server is intentionally a dumb pipe: clients POST opaque bytes to `/{pubkey}`, and the server forwards those bytes to the active Server-Sent Events stream for that pubkey. The server does not parse SDP, does not inspect ICE candidates, does not build envelopes, and does not own application semantics.
+Connect is an authenticated WebRTC signaling relay and matching client libraries.
+Authentication is done over ed25519 signatures and allows you to establish you are talking to who you intend to be talking to over malicious signaling servers.
+This project is built to be a public good.
+Signaling will remain free and terraform to run it yourself is available.
 
-The goal is to keep the relay simple enough that protocol changes live in clients, not in the server. Client libraries are responsible for signing, verifying, session binding, authorization policy, and deciding what an incoming message means.
+The server is intentionally a dumb pipe: clients POST opaque bytes to `/{pubkey}`, and the server forwards those bytes to the active Server-Sent Events stream for that pubkey.
+The server does not parse SDP, does not inspect ICE candidates, does not build envelopes, and does not own application semantics.
+
+The goal is to keep the relay simple enough that protocol changes live in clients, not in the server.
+Client libraries are responsible for signing, verifying, session binding, authorization policy, and deciding what an incoming message means.
 
 ## What This Is
 
