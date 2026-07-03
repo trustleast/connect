@@ -48,9 +48,8 @@ func run(ctx context.Context) error {
 			peers = append(peers, s)
 		}
 		pp = &staticPeerProvider{
-			proxyURL:   *proxyURL,
-			gossipAddr: *gossipAddr,
-			peers:      peers,
+			proxyURL: *proxyURL,
+			peers:    peers,
 		}
 	}
 
@@ -73,13 +72,10 @@ func run(ctx context.Context) error {
 }
 
 // staticPeerProvider implements connect.PeerProvider with a fixed peer list.
-// OnChange returns a channel that is never written to (the peer set never changes).
 type staticPeerProvider struct {
-	proxyURL   string
-	gossipAddr string
-	peers      []string
+	proxyURL string
+	peers    []string
 }
 
-func (p *staticPeerProvider) Self() string       { return p.proxyURL }
-func (p *staticPeerProvider) GossipAddr() string { return p.gossipAddr }
-func (p *staticPeerProvider) Peers() []string    { return p.peers }
+func (p *staticPeerProvider) Self() string    { return p.proxyURL }
+func (p *staticPeerProvider) Peers() []string { return p.peers }

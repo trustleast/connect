@@ -25,9 +25,7 @@ import (
 type PeerProvider interface {
 	// Self returns this node's public HTTP base URL used by peers when proxying POSTs.
 	Self() string
-	// GossipAddr returns the TCP address to bind the internal gossip listener (e.g. ":9876").
-	GossipAddr() string
-	// Peers returns the current set of peer internal gossip base URLs (excluding self),
+	// Peers returns the current set of peer gossip base URLs (excluding self),
 	// e.g. "http://[2001:db8::1]:9876".
 	Peers() []string
 }

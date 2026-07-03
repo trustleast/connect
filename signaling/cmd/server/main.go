@@ -149,8 +149,7 @@ type ec2PeerProvider struct {
 	peers []string
 }
 
-func (p *ec2PeerProvider) Self() string       { return p.proxyURL }
-func (p *ec2PeerProvider) GossipAddr() string { return p.gossipAddr }
+func (p *ec2PeerProvider) Self() string { return p.proxyURL }
 
 func (p *ec2PeerProvider) Peers() []string {
 	p.mu.RLock()
@@ -247,9 +246,9 @@ func run(ctx context.Context) error {
 	srvs := connect.NewServers(ctx, pp)
 
 	if srvs.Gossip != nil {
-		gossipLn, err := lc.Listen(ctx, "tcp", pp.GossipAddr())
+		gossipLn, err := lc.Listen(ctx, "tcp", cfg.GossipAddr)
 		if err != nil {
-			return fmt.Errorf("gossip listen %s: %w", pp.GossipAddr(), err)
+			return fmt.Errorf("gossip listen %s: %w", cfg.GossipAddr, err)
 		}
 		if tlsCfg != nil {
 			gossipLn = tls.NewListener(gossipLn, tlsCfg)

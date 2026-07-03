@@ -5,11 +5,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
-	"fmt"
 	"io"
-	"net"
 	"net/http"
-	"net/url"
 	"sync"
 	"time"
 
@@ -37,25 +34,16 @@ type peerSnapshot struct {
 //
 // gossip implements http.Handler; serve it on a separate internal-only listener.
 type gossip struct {
-	proxyURL    string
-	proxyScheme string // scheme parsed from pp.Self() — "http" or "https"
-	proxyPort   string // port parsed from pp.Self()
-	hub         *hub
-	pp          PeerProvider
-	client      *http.Client
+	hub    *hub
+	pp     PeerProvider
+	client *http.Client
 
 	mu          sync.RWMutex
-	peerByProxy map[string]*peerSnapshot // keyed by sender's derived proxy URL
+	peerByProxy map[string]*peerSnapshot // keyed by sender's proxy URL (from X-Proxy-URL header)
 }
 
 func newGossip(ctx context.Context, pp PeerProvider, h *hub) *gossip {
-	u, _ := url.Parse(pp.Self())
-	scheme := u.Scheme
-	_, port, _ := net.SplitHostPort(u.Host)
 	g := &gossip{
-		proxyURL:    pp.Self(),
-		proxyScheme: scheme,
-		proxyPort:   port,
 		hub:         h,
 		pp:          pp,
 		client:      &http.Client{Timeout: 5 * time.Second},
@@ -81,6 +69,7 @@ func (g *gossip) postTo(ctx context.Context, gossipBaseURL string, filterData []
 	if err != nil {
 		return
 	}
+	req.Header.Set("X-Proxy-URL", g.pp.Self())
 	resp, err := g.client.Do(req)
 	if err != nil {
 		return
@@ -96,12 +85,11 @@ func (g *gossip) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	senderIP, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		http.Error(w, "invalid remote addr", http.StatusBadRequest)
+	fromURL := r.Header.Get("X-Proxy-URL")
+	if fromURL == "" {
+		http.Error(w, "missing X-Proxy-URL header", http.StatusBadRequest)
 		return
 	}
-	fromURL := fmt.Sprintf("%s://%s", g.proxyScheme, net.JoinHostPort(senderIP, g.proxyPort))
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, _MaxGossipBody+1))
 	if err != nil {
@@ -139,7 +127,7 @@ func nodeToken(pubkey, proxyURL string) string {
 // The client receives this token on SSE connect and shares it with its peer,
 // who can attach it to POST requests to route directly to this node.
 func (g *gossip) tokenFor(pubkey string) string {
-	return nodeToken(pubkey, g.proxyURL)
+	return nodeToken(pubkey, g.pp.Self())
 }
 
 // findPeer returns the proxy base URL of the peer most likely to hold pubkey,

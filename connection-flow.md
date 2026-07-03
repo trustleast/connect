@@ -11,20 +11,22 @@ sequenceDiagram
     %% ── SSE subscription ──────────────────────────────────────────────
     D->>S: GET /{dialer_pubkey}<br/>?sig=base64url( sign(privkey, "connect.sse.v1\0" ‖ ts[8]) ‖ ts[8] )
     S-->>D: 200 text/event-stream (open)
+    S-->>D: event: node<br/>data: dialer_token  (node routing token, multi-node deployments only)
 
     A->>S: GET /{answerer_pubkey}<br/>?sig=base64url( sign(privkey, "connect.sse.v1\0" ‖ ts[8]) ‖ ts[8] )
     S-->>A: 200 text/event-stream (open)
+    S-->>A: event: node<br/>data: answerer_token  (node routing token, multi-node deployments only)
 
     %% ── Dial ──────────────────────────────────────────────────────────
     note over D: pc = new RTCPeerConnection()<br/>challenge = crypto.random(32 bytes)<br/>ts = unix seconds as uint64 big-endian (8 bytes)<br/>pc.createOffer → setLocalDescription<br/>(offer SDP contains dialer's DTLS fingerprint)
 
-    D->>S: POST /{answerer_pubkey}<br/>body: base64url(JSON{<br/>  from:      dialer_pubkey,<br/>  data:      offer_sdp,<br/>  challenge: base64url(challenge[32]),<br/>  ts:        base64url(ts[8]),<br/>  sig:       base64url(sign(privkey,<br/>    "connect.offer.v1\0" ‖ challenge ‖ ts[8] ‖ answerer_pubkey[32] ‖ offer_sdp))<br/>})
-    S-->>A: data: base64url(JSON{from, data, challenge, ts, sig})
+    D->>S: POST /{answerer_pubkey}<br/>body: base64url(JSON{<br/>  from:      dialer_pubkey,<br/>  data:      offer_sdp,<br/>  challenge: base64url(challenge[32]),<br/>  ts:        base64url(ts[8]),<br/>  sig:       base64url(sign(privkey,<br/>    "connect.offer.v1\0" ‖ challenge ‖ ts[8] ‖ answerer_pubkey[32] ‖ offer_sdp)),<br/>  token:     dialer_token  (omitted if not in a multi-node deployment)<br/>})
+    S-->>A: data: base64url(JSON{from, data, challenge, ts, sig, token?})
 
     %% ── Answer ────────────────────────────────────────────────────────
     note over A: 1. verify ts within ±30s window<br/>2. verify sig: "connect.offer.v1\0" ‖ challenge ‖ ts ‖ own_pubkey ‖ offer_sdp<br/>3. AcceptConnection(dialer_pubkey)? → false: drop silently<br/>4. pc = new RTCPeerConnection()<br/>5. pc.setRemoteDescription(offer)<br/>6. pc.createAnswer → setLocalDescription<br/>   (answer SDP contains answerer's DTLS fingerprint)<br/>7. ts_answer = unix seconds (8 bytes)<br/>8. onIncoming(pc, dialer_pubkey) — app wires handlers<br/>9. send answer
 
-    A->>S: POST /{dialer_pubkey}<br/>body: base64url(JSON{<br/>  from:      answerer_pubkey,<br/>  data:      answer_sdp,<br/>  challenge: base64url(challenge[32]),<br/>  ts:        base64url(ts_answer[8]),<br/>  sig:       base64url(sign(privkey,<br/>    "connect.answer.v1\0" ‖ challenge ‖ ts_answer[8] ‖ offer_sdp ‖ "\x00" ‖ answer_sdp))<br/>})
+    A->>S: POST /{dialer_pubkey}<br/>X-Node-Token: dialer_token  (if present in offer)<br/>body: base64url(JSON{<br/>  from:      answerer_pubkey,<br/>  data:      answer_sdp,<br/>  challenge: base64url(challenge[32]),<br/>  ts:        base64url(ts_answer[8]),<br/>  sig:       base64url(sign(privkey,<br/>    "connect.answer.v1\0" ‖ challenge ‖ ts_answer[8] ‖ offer_sdp ‖ "\x00" ‖ answer_sdp))<br/>})
     S-->>D: data: base64url(JSON{from, data, challenge, ts, sig})
 
     note over D: 1. verify challenge matches sent challenge<br/>2. verify ts_answer within ±30s window<br/>3. verify sig: "connect.answer.v1\0" ‖ challenge ‖ ts_answer ‖ pc.localDescription.sdp ‖ "\x00" ‖ answer_sdp<br/>4. failure → pc.close()<br/>5. pc.setRemoteDescription(answer)
@@ -36,7 +38,7 @@ sequenceDiagram
         note over A: verify sig: "connect.ice.v1\0" ‖ challenge ‖ data<br/>failure → pc.close()
         note over A: → pc.addIceCandidate
 
-        A->>S: POST /{dialer_pubkey}<br/>body: base64url(JSON{<br/>  from:      answerer_pubkey,<br/>  data:      JSON(candidate),<br/>  challenge: base64url(challenge[32]),<br/>  sig:       base64url(sign(privkey,<br/>    "connect.ice.v1\0" ‖ challenge ‖ JSON(candidate)))<br/>})
+        A->>S: POST /{dialer_pubkey}<br/>X-Node-Token: dialer_token  (if present in offer)<br/>body: base64url(JSON{<br/>  from:      answerer_pubkey,<br/>  data:      JSON(candidate),<br/>  challenge: base64url(challenge[32]),<br/>  sig:       base64url(sign(privkey,<br/>    "connect.ice.v1\0" ‖ challenge ‖ JSON(candidate)))<br/>})
         S-->>D: data: base64url(JSON{from, data, challenge, sig})
         note over D: verify sig: "connect.ice.v1\0" ‖ challenge ‖ data<br/>failure → pc.close()
         note over D: → pc.addIceCandidate

@@ -14,24 +14,21 @@ import (
 // The peer list is always empty; use injectPeer on the resulting gossip
 // to simulate peer state without actual HTTP traffic.
 type testPeerProvider struct {
-	self     string
-	onChange chan struct{}
+	self string
 }
 
 func newTestPeerProvider() *testPeerProvider {
-	return &testPeerProvider{self: "http://self", onChange: make(chan struct{}, 1)}
+	return &testPeerProvider{self: "http://self"}
 }
 
-func (p *testPeerProvider) Self() string              { return p.self }
-func (p *testPeerProvider) GossipAddr() string        { return ":0" }
-func (p *testPeerProvider) Peers() []string           { return nil }
-func (p *testPeerProvider) OnChange() <-chan struct{} { return p.onChange }
+func (p *testPeerProvider) Self() string    { return p.self }
+func (p *testPeerProvider) Peers() []string { return nil }
 
 // newTestGossip creates a gossip with no active peers or background goroutines.
 // Useful for unit tests that only call injectPeer + findPeer directly.
 func newTestGossip() *gossip {
 	return &gossip{
-		proxyURL:    "http://self",
+		pp:          newTestPeerProvider(),
 		hub:         newHub(context.Background()),
 		peerByProxy: make(map[string]*peerSnapshot),
 	}

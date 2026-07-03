@@ -66,7 +66,7 @@ Hostnames carry the routing budget:
 | Own node host   | Arrived at intended node   | Normal lookup; deliver only if this node is still the target                           |
 | Other node host | DNS drain/failure fallback | Recompute current target; 307 if target differs, 404 if it points back to the bad host |
 
-This replaces internal relay headers. Clients do not provide routing hints.
+Clients provide one routing hint: `X-Node-Token` on POST requests. This token is received from the target's SSE `event: node` first message and is included in offer bodies so that the answerer can attach it to replies. The server uses it to skip the gossip lookup and deliver directly to the target's home node. Absent the token, the server falls back to normal gossip-based routing.
 
 GET establishes where a pubkey listens. POST looks for the pubkey. Every POST checks
 the current region filter first:
