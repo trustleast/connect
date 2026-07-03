@@ -51,7 +51,6 @@ func run(ctx context.Context) error {
 			proxyURL:   *proxyURL,
 			gossipAddr: *gossipAddr,
 			peers:      peers,
-			onChange:   make(chan struct{}),
 		}
 	}
 
@@ -79,10 +78,8 @@ type staticPeerProvider struct {
 	proxyURL   string
 	gossipAddr string
 	peers      []string
-	onChange   chan struct{}
 }
 
-func (p *staticPeerProvider) Self() string             { return p.proxyURL }
-func (p *staticPeerProvider) GossipAddr() string       { return p.gossipAddr }
-func (p *staticPeerProvider) Peers() []string          { return p.peers }
-func (p *staticPeerProvider) OnChange() <-chan struct{} { return p.onChange }
+func (p *staticPeerProvider) Self() string       { return p.proxyURL }
+func (p *staticPeerProvider) GossipAddr() string { return p.gossipAddr }
+func (p *staticPeerProvider) Peers() []string    { return p.peers }

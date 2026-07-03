@@ -36,7 +36,6 @@ type serverConfig struct {
 	AWSRegion  string
 	GossipAddr string // TCP listen address for the internal gossip server (e.g. ":9876")
 	GossipPort string // gossip TCP port on peer nodes
-	ProxyURL   string // this node's internal HTTP base URL for peer proxying
 }
 
 func getConfig(ctx context.Context) (serverConfig, error) {
@@ -53,7 +52,6 @@ func getConfig(ctx context.Context) (serverConfig, error) {
 	configS3 := flag.String("config-s3", "", "S3 URI for JSON instance config, e.g. s3://bucket/key")
 	gossipAddr := flag.String("gossip-addr", cfg.GossipAddr, "TCP listen address for internal gossip server")
 	gossipPort := flag.String("gossip-port", cfg.GossipPort, "gossip TCP port on peer nodes")
-	proxyURL := flag.String("proxy-url", "", "this node's internal HTTP base URL for peer proxying")
 	flag.Parse()
 
 	region, err := detectRegion(ctx)
@@ -78,8 +76,6 @@ func getConfig(ctx context.Context) (serverConfig, error) {
 			cfg.GossipAddr = *gossipAddr
 		case "gossip-port":
 			cfg.GossipPort = *gossipPort
-		case "proxy-url":
-			cfg.ProxyURL = *proxyURL
 		}
 	})
 
@@ -101,18 +97,15 @@ func (cfg serverConfig) setupPeerProvider(ctx context.Context) (connect.PeerProv
 		return nil, nil
 	}
 
-	proxyURL := cfg.ProxyURL
-	if proxyURL == "" {
-		scheme := "https"
-		if cfg.Cert == "" {
-			scheme = "http"
-		}
-		port := cfg.Addr
-		if i := strings.LastIndex(port, ":"); i >= 0 {
-			port = port[i:]
-		}
-		proxyURL = fmt.Sprintf("%s://[%s]%s", scheme, ip.String(), port)
+	scheme := "https"
+	if cfg.Cert == "" {
+		scheme = "http"
 	}
+	port := cfg.Addr
+	if i := strings.LastIndex(port, ":"); i >= 0 {
+		port = port[i:]
+	}
+	proxyURL := fmt.Sprintf("%s://[%s]%s", scheme, ip.String(), port)
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.AWSRegion))
 	if err != nil {
@@ -135,7 +128,6 @@ func (cfg serverConfig) setupPeerProvider(ctx context.Context) (connect.PeerProv
 		region:       cfg.AWSRegion,
 		selfIP:       ip,
 		ec2:          ec2Client,
-		onChange:     make(chan struct{}, 1),
 	}
 	pp.start(ctx)
 	return pp, nil
@@ -144,23 +136,21 @@ func (cfg serverConfig) setupPeerProvider(ctx context.Context) (connect.PeerProv
 // ec2PeerProvider implements connect.PeerProvider by polling EC2 for running
 // instances in the same ASG.
 type ec2PeerProvider struct {
-	proxyURL    string
-	gossipAddr  string
-	gossipPort  string
+	proxyURL     string
+	gossipAddr   string
+	gossipPort   string
 	gossipScheme string // "http" or "https"
-	asgName     string
-	region      string
-	selfIP      net.IP
-	ec2         *ec2svc.Client
+	asgName      string
+	region       string
+	selfIP       net.IP
+	ec2          *ec2svc.Client
 
-	mu       sync.RWMutex
-	peers    []string
-	onChange chan struct{}
+	mu    sync.RWMutex
+	peers []string
 }
 
-func (p *ec2PeerProvider) Self() string              { return p.proxyURL }
-func (p *ec2PeerProvider) GossipAddr() string        { return p.gossipAddr }
-func (p *ec2PeerProvider) OnChange() <-chan struct{}  { return p.onChange }
+func (p *ec2PeerProvider) Self() string       { return p.proxyURL }
+func (p *ec2PeerProvider) GossipAddr() string { return p.gossipAddr }
 
 func (p *ec2PeerProvider) Peers() []string {
 	p.mu.RLock()
@@ -180,16 +170,8 @@ func (p *ec2PeerProvider) refresh(ctx context.Context) {
 	}
 
 	p.mu.Lock()
-	changed := !stringSlicesEqual(p.peers, peers)
 	p.peers = peers
 	p.mu.Unlock()
-
-	if changed {
-		select {
-		case p.onChange <- struct{}{}:
-		default:
-		}
-	}
 }
 
 func (p *ec2PeerProvider) start(ctx context.Context) {

@@ -30,10 +30,6 @@ type PeerProvider interface {
 	// Peers returns the current set of peer internal gossip base URLs (excluding self),
 	// e.g. "http://[2001:db8::1]:9876".
 	Peers() []string
-	// OnChange returns a channel that receives a signal whenever the peer set
-	// changes. The channel must never be closed. Callers re-read Peers() after
-	// receiving a signal.
-	OnChange() <-chan struct{}
 }
 
 const (
@@ -270,10 +266,15 @@ func (s *server) listenForMessages(w http.ResponseWriter, r *http.Request, pubke
 		return
 	}
 
-	s.hub.register(pubkeyStr, nc)
 	if s.gossip != nil {
-		s.gossip.broadcast()
+		token := s.gossip.tokenFor(pubkeyStr)
+		if _, err := nc.Write([]byte("event: node\ndata: " + token + "\n\n")); err != nil {
+			nc.Close()
+			return
+		}
 	}
+
+	s.hub.register(pubkeyStr, nc)
 }
 
 // tuneConnBuffers sets SO_RCVBUF and SO_SNDBUF on a connection, unwrapping
@@ -330,7 +331,8 @@ func (s *server) postMessage(w http.ResponseWriter, r *http.Request, targetStr s
 	// Local miss: proxy to a peer that claims this key if gossip is configured
 	// and this request has not already been proxied (prevent proxy loops).
 	if s.gossip != nil && r.Header.Get("X-Internal-Relay") == "" {
-		if proxyURL, ok := s.gossip.findPeer(targetStr); ok {
+		token := r.Header.Get("X-Node-Token")
+		if proxyURL, ok := s.gossip.findPeer(targetStr, token); ok {
 			s.proxyPost(w, r, proxyURL, targetStr, body[:n])
 			return
 		}
