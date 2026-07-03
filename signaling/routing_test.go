@@ -152,37 +152,25 @@ func TestTokenBypassGossip(t *testing.T) {
 	// missingMatchURL fallback in findPeer even when the filter says "no".
 	sA.gossip.injectStaleFilter(bURL)
 
-	// Read SSE events in one goroutine: capture the node token first, then
-	// relay any subsequent data messages.
+	// Read SSE data lines: the first is the raw node token; subsequent lines
+	// are wire messages.
 	tokenCh := make(chan string, 1)
 	dataCh := make(chan string, 1)
 	go func() {
 		s := bufio.NewScanner(sse.Body)
-		inNodeEvent := false
 		tokenSent := false
 		for s.Scan() {
-			line := s.Text()
-			switch {
-			case line == "event: node":
-				inNodeEvent = true
-			case inNodeEvent && !tokenSent:
-				if data, ok := strings.CutPrefix(line, "data: "); ok {
-					tokenCh <- data
-					tokenSent = true
-				}
-				if line == "" {
-					inNodeEvent = false
-				}
-			case inNodeEvent:
-				if line == "" {
-					inNodeEvent = false
-				}
-			default:
-				if data, ok := strings.CutPrefix(line, "data: "); ok {
-					dataCh <- data
-					return
-				}
+			data, ok := strings.CutPrefix(s.Text(), "data: ")
+			if !ok {
+				continue
 			}
+			if !tokenSent {
+				tokenCh <- data
+				tokenSent = true
+				continue
+			}
+			dataCh <- data
+			return
 		}
 	}()
 

@@ -266,7 +266,7 @@ func (s *server) listenForMessages(w http.ResponseWriter, r *http.Request, pubke
 
 	if s.gossip != nil {
 		token := s.gossip.tokenFor(pubkeyStr)
-		if _, err := nc.Write([]byte("event: node\ndata: " + token + "\n\n")); err != nil {
+		if _, err := nc.Write([]byte("data: " + token + "\n\n")); err != nil {
 			nc.Close()
 			return
 		}

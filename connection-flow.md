@@ -11,11 +11,11 @@ sequenceDiagram
     %% ── SSE subscription ──────────────────────────────────────────────
     D->>S: GET /{dialer_pubkey}<br/>?sig=base64url( sign(privkey, "connect.sse.v1\0" ‖ ts[8]) ‖ ts[8] )
     S-->>D: 200 text/event-stream (open)
-    S-->>D: event: node<br/>data: dialer_token  (node routing token, multi-node deployments only)
+    S-->>D: data: dialer_token  (raw node routing token, multi-node deployments only)
 
     A->>S: GET /{answerer_pubkey}<br/>?sig=base64url( sign(privkey, "connect.sse.v1\0" ‖ ts[8]) ‖ ts[8] )
     S-->>A: 200 text/event-stream (open)
-    S-->>A: event: node<br/>data: answerer_token  (node routing token, multi-node deployments only)
+    S-->>A: data: answerer_token  (raw node routing token, multi-node deployments only)
 
     %% ── Dial ──────────────────────────────────────────────────────────
     note over D: pc = new RTCPeerConnection()<br/>challenge = crypto.random(32 bytes)<br/>ts = unix seconds as uint64 big-endian (8 bytes)<br/>pc.createOffer → setLocalDescription<br/>(offer SDP contains dialer's DTLS fingerprint)
