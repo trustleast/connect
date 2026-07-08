@@ -1,11 +1,6 @@
-variable "availability_zones" {
-  type        = list(string)
-  description = "AZs to create VPC subnets in. Must contain at least asg_az_index + 1 entries."
-}
-
 variable "asg_availability_zone" {
   type        = string
-  description = "AZ name the ASG launches into (must be one of availability_zones), e.g. \"us-east-1a\"."
+  description = "AZ the ASG deploys into (must be one of availability_zones). Change this to migrate nodes to a different AZ."
 }
 
 variable "stage" {

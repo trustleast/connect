@@ -44,8 +44,7 @@ data "aws_ami" "amazon_linux" {
 module "vpc" {
   source = "../aws_ipv6_vpc"
 
-  name               = "connect"
-  availability_zones = var.availability_zones
+  name = "connect"
 }
 
 module "asg" {

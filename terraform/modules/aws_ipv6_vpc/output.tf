@@ -15,14 +15,6 @@ output "public_subnet_ids_by_az" {
   value = { for s in aws_subnet.public : s.availability_zone => s.id }
 }
 
-output "private_subnet_ids" {
-  value = aws_subnet.private[*].id
-}
-
 output "public_subnet_ipv6_cidrs" {
   value = aws_subnet.public[*].ipv6_cidr_block
-}
-
-output "private_subnet_ipv6_cidrs" {
-  value = aws_subnet.private[*].ipv6_cidr_block
 }

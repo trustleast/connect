@@ -73,7 +73,7 @@ module "region" {
 
   source = "./modules/region"
 
-  availability_zones = each.value.availability_zones
+  asg_availability_zone = each.value.asg_availability_zone
 
   stage         = var.stage
   instance_type = var.instance_type

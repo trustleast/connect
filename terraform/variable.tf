@@ -5,14 +5,9 @@ variable "stage" {
 
 variable "regions" {
   type = map(object({
-    availability_zones = list(string)
+    asg_availability_zone = string
   }))
-  description = "Map of AWS region to its configuration. AMI IDs are built automatically by the ami module using the Go source hash."
-
-  validation {
-    condition     = alltrue([for r in values(var.regions) : length(r.availability_zones) >= 1])
-    error_message = "Each region must have at least one availability zone."
-  }
+  description = "Map of AWS region to its configuration. The VPC automatically spans all AZs in the region; asg_availability_zone is the single AZ the ASG deploys into."
 }
 
 variable "instance_type" {
