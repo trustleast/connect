@@ -3,5 +3,5 @@ terraform/.terraform.tfstate.lock.info
 terraform/.terraform/
 terraform/terraform.tfstate
 terraform/modules/ami/ops-*.json
-terraform/modules/ami/connect-arm64
+terraform/connect-arm64
 *.prof

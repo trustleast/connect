@@ -16,6 +16,14 @@ const RECONNECT_MAX_MS = 30_000;
 const TS_WINDOW_SECS = 30;
 const CONN_CLEANUP_MS = 5_000;
 
+export type SignalDirection = "inbound-sse" | "outbound-post";
+
+export interface SignalEvent {
+  direction: SignalDirection;
+  remotePubkey: string;
+  payload: string;
+}
+
 export interface ConnectOptions {
   serverUrl: string;
   rtcConfiguration?: RTCConfiguration;
@@ -35,6 +43,11 @@ export interface ConnectOptions {
    * if a subsequent ICE candidate fails auth.
    */
   onIncoming?: (pc: RTCPeerConnection, remotePublicKey: CryptoKey) => void;
+  /**
+   * Passive observer for every raw signaling payload sent or received.
+   * Informational only — the callback cannot mutate or drop messages.
+   */
+  onSignal?: (event: SignalEvent) => void;
 }
 
 export type DialFailureCode =
@@ -70,6 +83,7 @@ type WireMessage = {
   challenge: string; // base64url(random[32]), set by dialer, echoed in all replies
   ts?: string; // base64url(uint64 unix seconds, big-endian) — offers and answers only
   sig: string; // signature — see crypto.ts for payload construction
+  token?: string; // sender's node routing token, not signed
 };
 
 type DialSettler = {
@@ -79,11 +93,13 @@ type DialSettler = {
 
 // Session holds the state for one active peer connection, keyed by
 // "pubkey:challengeB64". Outbound connections set offerSdp and settler;
-// inbound connections leave them undefined.
+// inbound connections leave them undefined. dialerToken is the routing token
+// extracted from the offer, appended as ?t=<token> on replies back to the dialer.
 type Session = {
   pc: RTCPeerConnection;
   offerSdp?: string; // set for outbound dials, used to verify the answer
   settler?: DialSettler; // set for outbound dials awaiting authentication
+  dialerToken?: string; // set for inbound connections, token from the offer
 };
 
 function pack(msg: WireMessage): string {
@@ -153,12 +169,20 @@ export class ConnectClient {
       remotePublicKey: CryptoKey,
     ) => boolean | Promise<boolean>;
     onIncoming?: (pc: RTCPeerConnection, remotePublicKey: CryptoKey) => void;
+    onSignal?: (event: SignalEvent) => void;
   };
   // Composite key "pubkey:challengeB64" → Session. Including the challenge
   // allows a single remote pubkey to have multiple simultaneous connections.
   private readonly sessions = new Map<string, Session>();
   private closed = false;
   private readonly abort = new AbortController();
+  private nodeToken = ""; // received as raw token data line on SSE connect
+  // Resolves when the SSE connection has delivered its first token. Reset at
+  // the top of each runSSE iteration so Dial callers block during reconnects.
+  private sseReadyResolve!: () => void;
+  private sseReady: Promise<void> = new Promise(
+    (r) => (this.sseReadyResolve = r),
+  );
 
   private constructor(
     keyPair: CryptoKeyPair,
@@ -174,6 +198,7 @@ export class ConnectClient {
       },
       acceptConnection: options.acceptConnection,
       onIncoming: options.onIncoming,
+      onSignal: options.onSignal,
     };
   }
 
@@ -237,6 +262,28 @@ export class ConnectClient {
     signal?.addEventListener("abort", onAbort, { once: true });
 
     try {
+      // Wait for an active SSE connection before dialing. sseReady is reset at
+      // the start of each runSSE iteration and resolved once the token arrives.
+      await (signal
+        ? Promise.race([
+            this.sseReady,
+            new Promise<never>((_, reject) =>
+              signal.addEventListener(
+                "abort",
+                () =>
+                  reject(
+                    new DialError(
+                      "signaling-failed",
+                      "dial aborted",
+                      signal.reason,
+                    ),
+                  ),
+                { once: true },
+              ),
+            ),
+          ])
+        : this.sseReady);
+
       await setup(pc);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -307,6 +354,7 @@ export class ConnectClient {
     pc: RTCPeerConnection,
     remotePubkey: string,
     challenge: Uint8Array,
+    nodeToken?: string,
   ): () => void {
     const pending: string[] = [];
     let released = false;
@@ -318,16 +366,24 @@ export class ConnectClient {
         pending.push(candidateJson);
         return;
       }
-      void this.postICE(remotePubkey, candidateJson, challenge).catch(() => {});
+      void this.postICE(
+        remotePubkey,
+        candidateJson,
+        challenge,
+        nodeToken,
+      ).catch(() => {});
     };
 
     return () => {
       if (released) return;
       released = true;
       for (const candidateJson of pending) {
-        void this.postICE(remotePubkey, candidateJson, challenge).catch(
-          () => {},
-        );
+        void this.postICE(
+          remotePubkey,
+          candidateJson,
+          challenge,
+          nodeToken,
+        ).catch(() => {});
       }
       pending.length = 0;
     };
@@ -357,6 +413,7 @@ export class ConnectClient {
       sig: await this.sign(
         offerPayload(challenge, ts, answererPubkeyBytes, offerSdp),
       ),
+      ...(this.nodeToken ? { token: this.nodeToken } : {}),
     });
   }
 
@@ -365,36 +422,59 @@ export class ConnectClient {
     answerSdp: string,
     challenge: Uint8Array,
     offerSdp: string,
+    nodeToken?: string,
   ): Promise<void> {
     const ts = currentTs();
-    await this.send(remotePubkey, {
-      from: this.pubkey,
-      data: answerSdp,
-      challenge: base64UrlEncode(challenge),
-      ts: base64UrlEncode(ts),
-      sig: await this.sign(answerPayload(challenge, ts, offerSdp, answerSdp)),
-    });
+    await this.send(
+      remotePubkey,
+      {
+        from: this.pubkey,
+        data: answerSdp,
+        challenge: base64UrlEncode(challenge),
+        ts: base64UrlEncode(ts),
+        sig: await this.sign(answerPayload(challenge, ts, offerSdp, answerSdp)),
+      },
+      nodeToken,
+    );
   }
 
   private async postICE(
     remotePubkey: string,
     candidateJson: string,
     challenge: Uint8Array,
+    nodeToken?: string,
   ): Promise<void> {
-    await this.send(remotePubkey, {
-      from: this.pubkey,
-      data: candidateJson,
-      challenge: base64UrlEncode(challenge),
-      sig: await this.sign(icePayload(challenge, candidateJson)),
-    });
+    await this.send(
+      remotePubkey,
+      {
+        from: this.pubkey,
+        data: candidateJson,
+        challenge: base64UrlEncode(challenge),
+        sig: await this.sign(icePayload(challenge, candidateJson)),
+      },
+      nodeToken,
+    );
   }
 
-  private async send(remotePubkey: string, msg: WireMessage): Promise<void> {
+  private async send(
+    remotePubkey: string,
+    msg: WireMessage,
+    nodeToken?: string,
+  ): Promise<void> {
+    const body = pack(msg);
+    this.options.onSignal?.({
+      direction: "outbound-post",
+      remotePubkey,
+      payload: body,
+    });
     // redirect: 'follow' re-sends the full POST body on 307, which is correct:
     // the signed body is already computed and is valid at any node.
-    const resp = await fetch(`${this.options.serverUrl}/${remotePubkey}`, {
+    const url = nodeToken
+      ? `${this.options.serverUrl}/${remotePubkey}?t=${nodeToken}`
+      : `${this.options.serverUrl}/${remotePubkey}`;
+    const resp = await fetch(url, {
       method: "POST",
-      body: pack(msg),
+      body,
       redirect: "follow",
     });
     if (!resp.ok) {
@@ -504,16 +584,22 @@ export class ConnectClient {
     }
 
     const incoming = new RTCPeerConnection(this.options.rtcConfiguration);
-    const releaseIce = this.wireIce(incoming, msg.from, challenge);
+    const releaseIce = this.wireIce(incoming, msg.from, challenge, msg.token);
     const key = this.sessionKey(msg.from, challenge);
-    this.sessions.set(key, { pc: incoming });
+    this.sessions.set(key, { pc: incoming, dialerToken: msg.token });
 
     try {
       await incoming.setRemoteDescription({ type: "offer", sdp: msg.data });
       this.options.onIncoming?.(incoming, senderKey);
       const answer = await incoming.createAnswer();
       await incoming.setLocalDescription(answer);
-      await this.postAnswer(msg.from, answer.sdp!, challenge, msg.data);
+      await this.postAnswer(
+        msg.from,
+        answer.sdp!,
+        challenge,
+        msg.data,
+        msg.token,
+      );
       releaseIce();
     } catch (e) {
       this.closeSession(key);
@@ -631,6 +717,9 @@ export class ConnectClient {
     );
 
     while (!this.closed) {
+      // Re-arm before each connection attempt so Dial callers block while
+      // disconnected or reconnecting.
+      this.sseReady = new Promise((r) => (this.sseReadyResolve = r));
       // Tracks whether the stream closed cleanly (server-initiated, e.g. node
       // eviction due to HRW ownership change) vs. due to an error.
       let cleanClose = false;
@@ -665,6 +754,7 @@ export class ConnectClient {
 
         const reader = resp.body.getReader();
         let buf = "";
+        let firstData = true;
 
         for (;;) {
           const { done, value } = await reader.read();
@@ -677,15 +767,26 @@ export class ConnectClient {
           while ((nl = buf.indexOf("\n")) >= 0) {
             const line = buf.slice(0, nl).trimEnd();
             buf = buf.slice(nl + 1);
-            if (line.startsWith("data: ")) {
-              const msg = unpack(line.slice(6));
-              // Process sequentially to preserve offer-before-candidate ordering.
-              // Errors are isolated per message — a bad message must not reconnect the SSE.
-              if (msg)
-                await this.dispatch(msg).catch((e) =>
-                  console.error("[signaling]", e),
-                );
+            if (!line.startsWith("data: ")) continue;
+            const data = line.slice(6);
+            if (firstData) {
+              firstData = false;
+              this.nodeToken = data;
+              this.sseReadyResolve();
+              continue;
             }
+            // Process sequentially to preserve offer-before-candidate ordering.
+            // Errors are isolated per message — a bad message must not reconnect the SSE.
+            this.options.onSignal?.({
+              direction: "inbound-sse",
+              remotePubkey: this.pubkey,
+              payload: data,
+            });
+            const msg = unpack(data);
+            if (msg)
+              await this.dispatch(msg).catch((e) =>
+                console.error("[signaling]", e),
+              );
           }
         }
       } catch (e: unknown) {

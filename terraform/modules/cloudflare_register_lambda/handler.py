@@ -1,19 +1,14 @@
-import hashlib
-import ipaddress
 import json
 import logging
 import os
-import time
 import urllib.request
 import urllib.parse
 import boto3
-from datetime import datetime, timezone, timedelta
 
 log = logging.getLogger()
 log.setLevel(logging.INFO)
 
 CF_API = "https://api.cloudflare.com/client/v4"
-DRAINING_TTL = timedelta(minutes=5)
 
 
 def cf_token():
@@ -25,8 +20,6 @@ def cf_token():
 
 
 def cf(method, path, token, body=None):
-    log.info("CF %s %s body=%s", method, path,
-             json.dumps(body) if body else None)
     req = urllib.request.Request(
         f"{CF_API}{path}",
         data=json.dumps(body).encode() if body else None,
@@ -46,7 +39,6 @@ def cf(method, path, token, body=None):
 
 
 def instance_ipv6(instance_id):
-    log.info("looking up IPv6 for instance %s", instance_id)
     ec2 = boto3.client("ec2", region_name=os.environ["AWS_REGION"])
     inst = ec2.describe_instances(InstanceIds=[instance_id])[
         "Reservations"][0]["Instances"][0]
@@ -58,36 +50,22 @@ def instance_ipv6(instance_id):
     raise ValueError(f"no IPv6 address found for {instance_id}")
 
 
-def asg_instances(asg_name, exclude_id=None):
-    """Return list of (instance_id, ipv6) for all running/pending ASG instances."""
-    log.info("querying ASG instances for %s (excluding %s)",
-             asg_name, exclude_id)
+def asg_active_ips(asg_name):
+    """Return dict of instance_id -> IPv6 for all running/pending ASG instances."""
     ec2 = boto3.client("ec2", region_name=os.environ["AWS_REGION"])
     paginator = ec2.get_paginator("describe_instances")
-    instances = []
+    instances = {}
     for page in paginator.paginate(Filters=[
         {"Name": "tag:aws:autoscaling:groupName", "Values": [asg_name]},
         {"Name": "instance-state-name", "Values": ["running", "pending"]},
     ]):
         for r in page["Reservations"]:
             for inst in r["Instances"]:
-                if inst["InstanceId"] == exclude_id:
-                    continue
                 for iface in inst.get("NetworkInterfaces", []):
                     for addr in iface.get("Ipv6Addresses", []):
-                        instances.append(
-                            (inst["InstanceId"], addr["Ipv6Address"]))
-    log.info("found %d ASG instances: %s", len(instances), instances)
+                        instances[inst["InstanceId"]] = addr["Ipv6Address"]
+    log.info("found %d active instances: %s", len(instances), instances)
     return instances
-
-
-def node_hostname(ip, zone_name):
-    """Derive node hostname from the first 4 bytes of SHA-256(canonical IP).
-    Matches the derivation in cmd/server/main.go ipNodeURL().
-    e.g. node-a1b2c3d4.peerwave.ai"""
-    canonical = str(ipaddress.ip_address(ip))
-    prefix = hashlib.sha256(canonical.encode()).hexdigest()[:8]
-    return f"node-{prefix}.{zone_name}"
 
 
 def get_records(zone_id, token, **filters):
@@ -116,35 +94,6 @@ def set_domain_records(zone_id, token, domain, ips, comment):
     cf("POST", f"/zones/{zone_id}/dns_records/batch", token, body)
 
 
-def cleanup_draining(zone_id, token):
-    """Delete draining CNAME records that have been stale for more than 5 minutes."""
-    now = datetime.now(timezone.utc)
-    records = get_records(zone_id, token, type="CNAME", **
-                          {"comment.startswith": "draining:"})
-    for rec in records:
-        modified = datetime.fromisoformat(rec["modified_on"])
-        age = now - modified
-        if age > DRAINING_TTL:
-            log.info("deleting stale draining record %s (age=%s)",
-                     rec["name"], age)
-            cf("DELETE", f"/zones/{zone_id}/dns_records/{rec['id']}", token)
-        else:
-            log.info("draining record %s is only %s old, leaving it",
-                     rec["name"], age)
-
-
-def cleanup_orphaned_nodes(zone_id, token, domain, active_ips):
-    """Delete node AAAA records whose IP is no longer in the active instance set."""
-    records = get_records(zone_id, token, type="AAAA", **
-                          {"comment.startswith": "signaling-node:"})
-    active_set = set(active_ips)
-    for rec in records:
-        if rec["content"] not in active_set:
-            log.info("deleting orphaned node record %s -> %s",
-                     rec["name"], rec["content"])
-            cf("DELETE", f"/zones/{zone_id}/dns_records/{rec['id']}", token)
-
-
 def complete_hook(detail):
     log.info("completing lifecycle hook %s with CONTINUE",
              detail["LifecycleHookName"])
@@ -161,27 +110,14 @@ def reconcile(asg_name):
     """Reconcile DNS to match current ASG state. Safe to run at any time."""
     zone_id = os.environ["CF_ZONE_ID"]
     domain = os.environ["CF_DOMAIN"]
-    zone_name = os.environ["CF_ZONE_NAME"]
 
     token = cf_token()
-    instances = asg_instances(asg_name)
-    active_ips = [ip for _, ip in instances]
-    log.info("reconciling %d active instances: %s", len(instances), instances)
+    instances = asg_active_ips(asg_name)
+    log.info("reconciling domain %s to %d active IPs: %s",
+             domain, len(instances), instances)
 
-    set_domain_records(zone_id, token, domain, active_ips,
-                       "signaling-round-robin")
-
-    for inst_id, inst_ip in instances:
-        inst_node = node_hostname(inst_ip, zone_name)
-        if not get_records(zone_id, token, name=inst_node, type="AAAA", content=inst_ip):
-            cf("POST", f"/zones/{zone_id}/dns_records", token, {
-                "type": "AAAA", "name": inst_node, "content": inst_ip,
-                "proxied": True, "ttl": 1,
-                "comment": f"signaling-node:{inst_id}",
-            })
-
-    cleanup_orphaned_nodes(zone_id, token, domain, active_ips)
-    cleanup_draining(zone_id, token)
+    set_domain_records(zone_id, token, domain, list(
+        instances.values()), "signaling-round-robin")
 
 
 def handler(event, context):
@@ -191,7 +127,6 @@ def handler(event, context):
     is_launch = "LAUNCHING" in detail["LifecycleTransition"]
     zone_id = os.environ["CF_ZONE_ID"]
     domain = os.environ["CF_DOMAIN"]
-    zone_name = os.environ["CF_ZONE_NAME"]
 
     log.info("event: instance=%s asg=%s transition=%s",
              instance_id, asg_name, detail["LifecycleTransition"])
@@ -203,78 +138,32 @@ def handler(event, context):
         complete_hook(detail)
         return
 
+    # Build the authoritative set of active IPs.
+    # On scale-down, remove the terminating instance. On scale-up, add the
+    # launching instance even if EC2 doesn't yet show it as "running".
     try:
-        ip = instance_ipv6(instance_id)
-    except Exception as e:
-        log.error("failed to get instance IPv6: %s", e)
-        complete_hook(detail)
-        return
-
-    node_name = node_hostname(ip, zone_name)
-
-    # Build the authoritative set of active instances.
-    # Exclude the terminating instance on scale-down; include the new instance
-    # on scale-up even if EC2 doesn't yet show it as "running".
-    try:
-        instances = asg_instances(
-            asg_name, exclude_id=None if is_launch else instance_id)
-        if is_launch and ip not in [i for _, i in instances]:
-            instances.append((instance_id, ip))
+        instances = asg_active_ips(asg_name)
     except Exception as e:
         log.error("failed to get ASG instances: %s", e)
         complete_hook(detail)
         return
 
-    active_ips = [i for _, i in instances]
-
-    # 1. Set main domain round-robin to exactly the active instance set.
-    try:
-        set_domain_records(zone_id, token, domain,
-                           active_ips, "signaling-round-robin")
-    except Exception as e:
-        log.error("failed to set domain round-robin for %s: %s", domain, e)
-
-    # 2. Ensure a node-specific AAAA record exists for every active instance.
-    for inst_id, inst_ip in instances:
-        inst_node = node_hostname(inst_ip, zone_name)
+    if is_launch:
         try:
-            if not get_records(zone_id, token, name=inst_node, type="AAAA", content=inst_ip):
-                cf("POST", f"/zones/{zone_id}/dns_records", token, {
-                    "type": "AAAA", "name": inst_node, "content": inst_ip,
-                    "proxied": True, "ttl": 1,
-                    "comment": f"signaling-node:{inst_id}",
-                })
+            ip = instance_ipv6(instance_id)
+            instances[instance_id] = ip
         except Exception as e:
-            log.error("failed to ensure node record %s: %s", inst_node, e)
+            log.error("failed to get instance IPv6: %s", e)
+            complete_hook(detail)
+            return
+    else:
+        instances.pop(instance_id, None)
 
-    # 3. On scale-down: flip the terminating node's record to a CNAME so cached
-    #    clients following the redirect land on an active node. If no AAAA record
-    #    exists (e.g. launch handler failed), create the CNAME directly so clients
-    #    with any stale DNS entry are still redirected.
-    if not is_launch:
-        try:
-            records = get_records(zone_id, token, name=node_name, type="AAAA")
-            draining_body = {
-                "type": "CNAME", "name": node_name, "content": domain,
-                "proxied": True, "ttl": 1,
-                "comment": f"draining:{instance_id}",
-            }
-            if records:
-                cf("PUT",
-                   f"/zones/{zone_id}/dns_records/{records[0]['id']}", token, draining_body)
-            else:
-                log.info(
-                    "no AAAA record found for %s, creating draining CNAME directly", node_name)
-                cf("POST", f"/zones/{zone_id}/dns_records",
-                   token, draining_body)
-        except Exception as e:
-            log.error("failed to flip node record %s to CNAME: %s", node_name, e)
-
-    # 4. Remove draining CNAME records that have been around for more than 5 minutes.
     try:
-        cleanup_draining(zone_id, token)
+        set_domain_records(zone_id, token, domain, list(
+            instances.values()), "signaling-round-robin")
     except Exception as e:
-        log.error("failed to clean up draining records: %s", e)
+        log.error("failed to set domain records for %s: %s", domain, e)
 
     complete_hook(detail)
 

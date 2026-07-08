@@ -2,55 +2,19 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"flag"
 	"fmt"
 	"log"
 	"net"
-	"net/url"
+	"net/http"
 	"strings"
 	"time"
 
 	"connect"
 )
 
-// serverConfig is the fully resolved runtime configuration. JSON tags allow it
-// to be decoded directly from the S3 cluster config; CLI-only fields use
-// json:"-". Priority: defaults → S3 → explicit CLI flags (see getConfig).
-type serverConfig struct {
-	Addr    string
-	Network string
-}
-
-func getConfig(ctx context.Context) (serverConfig, error) {
-	// 1. Sensible defaults.
-	cfg := serverConfig{
-		Addr:    ":8080",
-		Network: "tcp",
-	}
-
-	// Define flags. Defaults match cfg above so the usage text is accurate, but
-	// cfg is the authoritative default — flag values are only applied when the
-	// flag was explicitly set on the command line (see flag.Visit below).
-	addr := flag.String("addr", cfg.Addr, "listen address")
-	network := flag.String("network", cfg.Network, "listen network (tcp, tcp4, tcp6)")
-	flag.Parse()
-
-	flag.Visit(func(f *flag.Flag) {
-		switch f.Name {
-		case "addr":
-			cfg.Addr = *addr
-		case "network":
-			cfg.Network = *network
-		}
-	})
-
-	return cfg, nil
-}
-
 func main() {
 	ctx := context.Background()
-
 	if err := run(ctx); err != nil {
 		for {
 			log.Println("fatal:", err)
@@ -60,67 +24,58 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	nodeURL := flag.String("url", "", "The url pointing to this node")
-	peers := flag.String("peers", "", "comma-separated static peer base URLs, e.g. http://localhost:8081,http://localhost:8082")
-	secret := flag.String("secret", "", "The secret to seed the peer finder with")
+	addr := flag.String("addr", ":8080", "TCP listen address")
+	network := flag.String("network", "tcp", "listen network (tcp, tcp4, tcp6)")
+	gossipAddr := flag.String("gossip-addr", ":9876", "TCP listen address for internal gossip server")
+	gossipPeers := flag.String("gossip-peers", "", "comma-separated peer gossip base URLs (e.g. http://localhost:9877)")
+	proxyURL := flag.String("proxy-url", "", "this node's public HTTP base URL (e.g. http://localhost:8080)")
 	flag.Parse()
 
-	cfg, err := getConfig(ctx)
-	if err != nil {
-		return fmt.Errorf("getting config: %w", err)
-	}
-
 	lc := net.ListenConfig{}
-	ln, err := lc.Listen(ctx, cfg.Network, cfg.Addr)
+	ln, err := lc.Listen(ctx, *network, *addr)
 	if err != nil {
-		return fmt.Errorf("listen %s %s: %w", cfg.Network, cfg.Addr, err)
+		return fmt.Errorf("listen %s %s: %w", *network, *addr, err)
 	}
 
-	var peerFinder connect.PeerFinder
-	if peers := strings.Split(*peers, ","); len(peers) > 0 && *nodeURL != "" {
-		pf, err := newStaticPeerFinder(*nodeURL, peers, *secret)
-		if err != nil {
-			return err
+	var pp connect.PeerProvider
+	if *gossipPeers != "" {
+		var peers []string
+		for _, s := range strings.Split(*gossipPeers, ",") {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+			peers = append(peers, s)
 		}
-		peerFinder = pf
-	}
-
-	fmt.Println("Listening on:", cfg.Network, cfg.Addr)
-	srv := connect.NewHTTPServer(ctx, peerFinder)
-	return srv.Serve(ln)
-}
-
-// staticPeerFinder implements connect.PeerFinder for a fixed peer list.
-// OnChange returns a channel that is never written to because the peer set never changes.
-type staticPeerFinder struct {
-	nodeURL  *url.URL
-	peers    []*url.URL
-	onChange chan struct{}
-	secret   [32]byte
-}
-
-func newStaticPeerFinder(nodeURL string, peerStrs []string, secret string) (*staticPeerFinder, error) {
-	u, err := url.Parse(nodeURL)
-	if err != nil {
-		return nil, err
-	}
-	peerURLs := make([]*url.URL, 0, len(peerStrs))
-	for _, p := range peerStrs {
-		u, err := url.Parse(strings.TrimSpace(p))
-		if err != nil {
-			return nil, err
+		pp = &staticPeerProvider{
+			proxyURL: *proxyURL,
+			peers:    peers,
 		}
-		peerURLs = append(peerURLs, u)
 	}
-	return &staticPeerFinder{
-		nodeURL:  u,
-		peers:    peerURLs,
-		onChange: make(chan struct{}),
-		secret:   sha256.Sum256([]byte(secret)),
-	}, nil
+
+	fmt.Println("Listening on:", *network, *addr)
+	srvs := connect.NewServers(ctx, pp)
+
+	if srvs.Gossip != nil {
+		gossipLn, err := lc.Listen(ctx, "tcp", *gossipAddr)
+		if err != nil {
+			return fmt.Errorf("gossip listen %s: %w", *gossipAddr, err)
+		}
+		go func() {
+			if err := srvs.Gossip.Serve(gossipLn); err != nil && err != http.ErrServerClosed {
+				log.Printf("gossip server: %v", err)
+			}
+		}()
+	}
+
+	return srvs.Public.Serve(ln)
 }
 
-func (f *staticPeerFinder) Node() *url.URL            { return f.nodeURL }
-func (f *staticPeerFinder) Peers() []*url.URL         { return f.peers }
-func (f *staticPeerFinder) OnChange() <-chan struct{} { return f.onChange }
-func (f *staticPeerFinder) Secret() [32]byte          { return f.secret }
+// staticPeerProvider implements connect.PeerProvider with a fixed peer list.
+type staticPeerProvider struct {
+	proxyURL string
+	peers    []string
+}
+
+func (p *staticPeerProvider) Self() string    { return p.proxyURL }
+func (p *staticPeerProvider) Peers() []string { return p.peers }

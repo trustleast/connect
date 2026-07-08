@@ -37,10 +37,7 @@ locals {
     ssh_pub_key   = var.ssh_pub_key
     region        = data.aws_region.current.region
     args = join(" ", [
-      "-addr", "[::]:443",
-      "-network", "tcp6",
       "-config-s3", "s3://${aws_s3_bucket.config.bucket}/config.json",
-      "-zone-name", var.zone_name,
     ])
   }))
 }
@@ -85,6 +82,9 @@ resource "aws_s3_object" "config" {
     Key           = base64encode(var.key_pem)
     ASG           = local.asg_name
     ClusterSecret = var.cluster_secret
+    Addr          = "[::]:443"
+    GossipAddr    = "[::]:9876"
+    Network       = "tcp6"
   })
 }
 
@@ -162,11 +162,19 @@ resource "aws_security_group" "instance" {
     cidr_blocks      = data.cloudflare_ip_ranges.ip_ranges.ipv4_cidr_blocks
   }
 
+  # Allow intra-cluster TCP 443 and gossip UDP 9876 between instances in the same SG.
   ingress {
-    from_port        = 8080
-    to_port          = 8080
-    protocol         = "tcp"
-    ipv6_cidr_blocks = ["::/0"]
+    from_port = 443
+    to_port   = 443
+    protocol  = "tcp"
+    self      = true
+  }
+
+  ingress {
+    from_port = 9876
+    to_port   = 9876
+    protocol  = "udp"
+    self      = true
   }
 
   # Outbound HTTPS for SSM, EC2 APIs, and NTP (all over IPv6).
@@ -239,7 +247,7 @@ resource "aws_autoscaling_group" "this" {
   max_size         = var.max_size
   desired_capacity = var.desired_capacity
 
-  vpc_zone_identifier = var.subnets
+  vpc_zone_identifier = [var.subnet_id]
 
   health_check_type         = "EC2"
   health_check_grace_period = 120

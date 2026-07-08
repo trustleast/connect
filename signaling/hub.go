@@ -5,10 +5,12 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/FastFilter/xorfilter"
 )
 
-// hub manages live SSE connections keyed by base32 public key.
-// At most one connection per key is kept; registering a second closes the first.
+// hub manages live SSE connections keyed by base64url public key.
+// At most one connection per key; registering a second closes the first.
 //
 // sync.Map is used because the access pattern is write-once-per-connection,
 // read-many-per-message — exactly the case sync.Map's lock-free read path
@@ -23,44 +25,13 @@ type conn struct {
 	nc net.Conn
 }
 
-// newHub creates a hub and starts a single shared keepalive ticker that sends
-// SSE keep-alive comments to all active connections. The ticker runs until ctx
-// is cancelled, at which point all connections are closed.
-func newHub(ctx context.Context, peerFinder PeerFinder) *hub {
+// newHub creates a hub and starts the shared keepalive goroutine.
+func newHub(ctx context.Context) *hub {
 	h := &hub{}
-	go h.cleanUnownedConnections(ctx, peerFinder)
 	go h.keepalive(ctx)
 	return h
 }
 
-func (h *hub) cleanUnownedConnections(ctx context.Context, peerFinder PeerFinder) {
-	if peerFinder == nil {
-		return
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case _, ok := <-peerFinder.OnChange():
-			if !ok {
-				return
-			}
-
-			thisNode := peerFinder.Node()
-			h.clients.Range(func(k, val any) bool {
-				pubkey := k.(string)
-				target := targetPeer(peerFinder, pubkey)
-				if target == nil || target.Host != thisNode.Host {
-					c := val.(*conn)
-					if h.clients.CompareAndDelete(k, c) {
-						c.nc.Close()
-					}
-				}
-				return true
-			})
-		}
-	}
-}
 func (h *hub) keepalive(ctx context.Context) {
 	tick := time.NewTicker(20 * time.Second)
 	defer tick.Stop()
@@ -101,6 +72,30 @@ func (h *hub) register(pubkey string, nc net.Conn) {
 	}
 }
 
+// buildFilter constructs a BinaryFuse[uint8] over all currently registered
+// pubkeys, suitable for gossip broadcast. Returns nil when no clients are
+// connected. Duplicate hashes (astronomically rare) are silently deduplicated
+// as required by xorfilter.
+func (h *hub) buildFilter() *xorfilter.BinaryFuse[uint8] {
+	seen := make(map[uint64]struct{})
+	h.clients.Range(func(k, _ any) bool {
+		seen[pubkeyToUint64(k.(string))] = struct{}{}
+		return true
+	})
+	if len(seen) == 0 {
+		return nil
+	}
+	keys := make([]uint64, 0, len(seen))
+	for k := range seen {
+		keys = append(keys, k)
+	}
+	f, err := xorfilter.NewBinaryFuse[uint8](keys)
+	if err != nil {
+		return nil
+	}
+	return f
+}
+
 // deliver writes a pre-framed SSE payload to the stream registered under
 // pubkey. The caller is responsible for framing (prefix + body + suffix).
 // Returns false if pubkey has no active connection or the write fails.
@@ -120,4 +115,19 @@ func (h *hub) deliver(pubkey string, frame []byte) bool {
 		return false
 	}
 	return true
+}
+
+// pubkeyToUint64 maps a base64url-encoded ed25519 public key to a uint64 for
+// the BinaryFuse filter. Inlined FNV-1a avoids allocating a hash.Hash object.
+func pubkeyToUint64(b64key string) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	for i := 0; i < len(b64key); i++ {
+		h ^= uint64(b64key[i])
+		h *= prime64
+	}
+	return h
 }

@@ -51,8 +51,8 @@ module "vpc" {
 module "asg" {
   source = "../aws_autoscaling_group"
 
-  vpc_id  = module.vpc.vpc_id
-  subnets = module.vpc.public_subnet_ids
+  vpc_id    = module.vpc.vpc_id
+  subnet_id = module.vpc.public_subnet_ids_by_az[var.asg_availability_zone]
 
   name  = "connect"
   stage = var.stage
