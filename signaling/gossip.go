@@ -46,7 +46,7 @@ type gossip struct {
 	pp     PeerProvider
 	client *http.Client
 
-	peers sync.Map // *peerSnapshot, keyed by sender's proxy URL (from X-Proxy-URL header)
+	peers sync.Map // *peerSnapshot, keyed by sender's proxy URL (from Connect-Proxy-URL header)
 }
 
 func newGossip(ctx context.Context, pp PeerProvider, h *hub) *gossip {
@@ -75,7 +75,7 @@ func (g *gossip) postTo(ctx context.Context, gossipBaseURL string, filterData []
 	if err != nil {
 		return
 	}
-	req.Header.Set("X-Proxy-URL", g.pp.Self())
+	req.Header.Set("Connect-Proxy-URL", g.pp.Self())
 	resp, err := g.client.Do(req)
 	if err != nil {
 		return
@@ -95,7 +95,7 @@ func (g *gossip) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fromURL := r.Header.Get("X-Proxy-URL")
+	fromURL := r.Header.Get("Connect-Proxy-URL")
 	if fromURL == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		return

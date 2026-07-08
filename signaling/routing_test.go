@@ -103,7 +103,7 @@ func TestProxyOnMiss(t *testing.T) {
 	assertEqual(t, data, string(testSDP))
 }
 
-// TestProxyLoopPrevention verifies that a proxied POST (X-Internal-Relay: 1)
+// TestProxyLoopPrevention verifies that a proxied POST (Connect-Internal-Relay: 1)
 // is never re-proxied on a miss, and returns 404 instead.
 func TestProxyLoopPrevention(t *testing.T) {
 	pp := newTestPeerProvider()
@@ -118,7 +118,7 @@ func TestProxyLoopPrevention(t *testing.T) {
 	s.gossip.injectPeer(pubStr, "http://127.0.0.1:19999") // unreachable
 
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/"+pubStr, bytes.NewReader(testSDP))
-	req.Header.Set("X-Internal-Relay", "1")
+	req.Header.Set("Connect-Internal-Relay", "1")
 	resp, err := (&http.Client{}).Do(req)
 	assertEqual(t, err, nil)
 	resp.Body.Close()

@@ -91,12 +91,12 @@ a direct routing hint across regions without a separate presence lookup.
 
 Each node maintains a `BinaryFuse[uint8]` filter over its locally-connected SSE pubkeys.
 Every 5 seconds, the node POSTs the serialized filter to each known peer's `/gossip`
-endpoint. The sender identifies itself in the `X-Proxy-URL` request header. The receiver
+endpoint. The sender identifies itself in the `Connect-Proxy-URL` request header. The receiver
 stores the snapshot keyed by that URL with a 30-second expiry.
 
 ```
 POST /gossip HTTP/1.1
-X-Proxy-URL: https://[2001:db8::1]:8080
+Connect-Proxy-URL: https://[2001:db8::1]:8080
 Content-Type: application/octet-stream
 
 <serialized BinaryFuse[uint8]>
@@ -120,7 +120,7 @@ On a local hub miss, the node runs the following lookup sequence:
 
 3. **404** — if no peer claims the key.
 
-`X-Internal-Relay: 1` is set on proxied requests to prevent proxy loops; a node that
+`Connect-Internal-Relay: 1` is set on proxied requests to prevent proxy loops; a node that
 receives a proxied request never re-proxies it.
 
 ### Intra-Cluster Routing Rules
@@ -128,7 +128,7 @@ receives a proxied request never re-proxies it.
 | Request param/header | Behavior                                                                              |
 | -------------------- | ------------------------------------------------------------------------------------- |
 | `?t=<token>`         | Bypass filter scan; proxy to the matching peer's proxy URL                            |
-| `X-Internal-Relay`   | Already proxied; attempt local deliver only, return 404 on miss — never re-proxy      |
+| `Connect-Internal-Relay`   | Already proxied; attempt local deliver only, return 404 on miss — never re-proxy      |
 | (none)               | Local deliver first; fall back to filter scan; 404 on total miss                      |
 
 ---

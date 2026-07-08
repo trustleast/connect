@@ -63,6 +63,7 @@ var (
 type server struct {
 	hub            *hub
 	gossip         *gossip // nil in single-node mode
+	pp             PeerProvider
 	proxyClient    *http.Client
 	framePool      sync.Pool
 	authDecodePool sync.Pool
@@ -117,6 +118,7 @@ func newServer(ctx context.Context, pp PeerProvider) *server {
 	return &server{
 		hub:    h,
 		gossip: g,
+		pp:     pp,
 		proxyClient: &http.Client{
 			Timeout: 10 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -157,6 +159,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h["Access-Control-Allow-Origin"] = corsOriginAny
+	if s.pp != nil {
+		h.Set("Connect-Node", s.pp.Self())
+	}
 	pubKey := strings.Trim(r.URL.Path, "/")
 	if len(pubKey) != 43 {
 		http.Error(w, errInvalidPubKey.Error(), http.StatusBadRequest)
@@ -331,7 +336,7 @@ func (s *server) postMessage(w http.ResponseWriter, r *http.Request, targetStr s
 
 	// Local miss: proxy to a peer that claims this key if gossip is configured
 	// and this request has not already been proxied (prevent proxy loops).
-	if s.gossip != nil && r.Header.Get("X-Internal-Relay") == "" {
+	if s.gossip != nil && r.Header.Get("Connect-Internal-Relay") == "" {
 		token := r.URL.Query().Get("t")
 		if proxyURL, ok := s.gossip.findPeer(targetStr, token); ok {
 			s.proxyPost(w, r, proxyURL, targetStr, body[:n])
@@ -351,7 +356,7 @@ func (s *server) proxyPost(w http.ResponseWriter, r *http.Request, proxyBaseURL,
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	req.Header.Set("X-Internal-Relay", "1")
+	req.Header.Set("Connect-Internal-Relay", "1")
 
 	resp, err := s.proxyClient.Do(req)
 	if err != nil {
