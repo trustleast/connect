@@ -4,8 +4,10 @@ import (
 	"cmp"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"log"
@@ -115,6 +117,11 @@ func (cfg serverConfig) setupPeerProvider(ctx context.Context) (connect.PeerProv
 		return nil, err
 	}
 
+	tlsName, err := certServerName(cfg.Cert)
+	if err != nil {
+		return nil, err
+	}
+
 	pp := &ec2PeerProvider{
 		proxyURL:     proxyURL,
 		asgName:      cfg.ASG,
@@ -123,6 +130,7 @@ func (cfg serverConfig) setupPeerProvider(ctx context.Context) (connect.PeerProv
 		ec2:          ec2Client,
 		gossipPort:   gossipPort,
 		gossipScheme: scheme,
+		tlsName:      tlsName,
 	}
 	go pp.start(ctx)
 	return pp, nil
@@ -138,12 +146,14 @@ type ec2PeerProvider struct {
 	ec2          *ec2svc.Client
 	gossipScheme string
 	gossipPort   string
+	tlsName      string
 
 	mu    sync.RWMutex
 	peers []string
 }
 
-func (p *ec2PeerProvider) Self() string { return p.proxyURL }
+func (p *ec2PeerProvider) Self() string          { return p.proxyURL }
+func (p *ec2PeerProvider) TLSServerName() string { return p.tlsName }
 
 func (p *ec2PeerProvider) Peers() []string {
 	p.mu.RLock()
@@ -259,6 +269,30 @@ func getS3Config(ctx context.Context, uri, region string, cfg *serverConfig) err
 	}
 	defer out.Body.Close()
 	return json.NewDecoder(out.Body).Decode(cfg)
+}
+
+// certServerName extracts the TLS server name from a base64-encoded PEM certificate.
+// It returns the first non-wildcard DNS SAN, falling back to the Common Name.
+// Used to auto-configure ServerName for inter-node HTTPS when connecting by IP.
+func certServerName(certB64 string) (string, error) {
+	certPEM, err := base64.StdEncoding.DecodeString(certB64)
+	if err != nil {
+		return "", err
+	}
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return "", fmt.Errorf("no PEM block in certificate")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", err
+	}
+	for _, name := range cert.DNSNames {
+		if !strings.HasPrefix(name, "*.") {
+			return name, nil
+		}
+	}
+	return cert.Subject.CommonName, nil
 }
 
 func buildTLS(certB64, keyB64 string) (*tls.Config, error) {

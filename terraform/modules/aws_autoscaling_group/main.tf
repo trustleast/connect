@@ -165,7 +165,7 @@ resource "aws_security_group" "instance" {
   ingress {
     from_port = 9876
     to_port   = 9876
-    protocol  = "udp"
+    protocol  = "tcp"
     self      = true
   }
 
@@ -175,6 +175,13 @@ resource "aws_security_group" "instance" {
     to_port          = 443
     protocol         = "tcp"
     ipv6_cidr_blocks = ["::/0"]
+  }
+
+  egress {
+    from_port = 9876
+    to_port   = 9876
+    protocol  = "tcp"
+    self      = true
   }
 }
 
@@ -266,6 +273,7 @@ resource "aws_autoscaling_group" "this" {
 
   lifecycle {
     create_before_destroy = true
+    ignore_changes        = [desired_capacity, min_size, max_size]
   }
 }
 

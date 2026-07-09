@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -49,11 +50,18 @@ type gossip struct {
 	peers sync.Map // *peerSnapshot, keyed by sender's proxy URL (from Connect-Proxy-URL header)
 }
 
-func newGossip(ctx context.Context, pp PeerProvider, h *hub) *gossip {
+func newGossip(ctx context.Context, pp PeerProvider, h *hub, tlsCfg *tls.Config) *gossip {
+	transport := &http.Transport{}
+	if tlsCfg != nil {
+		transport.TLSClientConfig = tlsCfg
+	}
 	g := &gossip{
-		hub:    h,
-		pp:     pp,
-		client: &http.Client{Timeout: 5 * time.Second},
+		hub: h,
+		pp:  pp,
+		client: &http.Client{
+			Transport: transport,
+			Timeout:   5 * time.Second,
+		},
 	}
 	go g.periodicBroadcast(ctx)
 	return g
@@ -78,6 +86,7 @@ func (g *gossip) postTo(ctx context.Context, gossipBaseURL string, filterData []
 	req.Header.Set("Connect-Proxy-URL", g.pp.Self())
 	resp, err := g.client.Do(req)
 	if err != nil {
+		fmt.Printf("Error posting to %s: %v\n", gossipBaseURL, err)
 		return
 	}
 	_, err = io.ReadAll(resp.Body)

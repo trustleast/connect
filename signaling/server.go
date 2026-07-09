@@ -30,6 +30,15 @@ type PeerProvider interface {
 	Peers() []string
 }
 
+// TLSNamer is an optional interface for PeerProvider implementations that use
+// HTTPS for inter-node communication with IP-based addresses. When implemented,
+// the returned name is set as tls.Config.ServerName on all inter-node HTTP
+// clients, allowing certificate verification against the node hostname even
+// when connecting by IP.
+type TLSNamer interface {
+	TLSServerName() string
+}
+
 const (
 	_AuthMessageSize   = 8 + ed25519.SignatureSize
 	_MaxBodySize       = 4 << 10
@@ -111,16 +120,32 @@ func NewServers(ctx context.Context, pp PeerProvider) *Servers {
 
 func newServer(ctx context.Context, pp PeerProvider) *server {
 	h := newHub(ctx)
+
+	var interNodeTLS *tls.Config
+	if tn, ok := pp.(TLSNamer); ok {
+		if name := tn.TLSServerName(); name != "" {
+			fmt.Println("Using inter-node TLS with ServerName:", name)
+			interNodeTLS = &tls.Config{ServerName: name, MinVersion: tls.VersionTLS13}
+		}
+	}
+
 	var g *gossip
 	if pp != nil {
-		g = newGossip(ctx, pp, h)
+		g = newGossip(ctx, pp, h, interNodeTLS)
+	}
+
+	proxyTransport := &http.Transport{
+		TLSClientConfig:     interNodeTLS, // nil is safe: uses system defaults
+		MaxIdleConnsPerHost: 2,            // one per peer is typical; 2 for burst
+		IdleConnTimeout:     90 * time.Second,
 	}
 	return &server{
 		hub:    h,
 		gossip: g,
 		pp:     pp,
 		proxyClient: &http.Client{
-			Timeout: 10 * time.Second,
+			Transport: proxyTransport,
+			Timeout:   2 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
