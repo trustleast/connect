@@ -44,11 +44,6 @@ variable "desired_capacity" {
   default = 1
 }
 
-variable "ssh_pub_key" {
-  type        = string
-  description = "SSH public key added to ec2-user's authorized_keys on each instance."
-}
-
 variable "zone_name" {
   type        = string
   description = "DNS zone for peer URL derivation, e.g. example.com"

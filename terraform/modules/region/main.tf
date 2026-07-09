@@ -58,7 +58,6 @@ module "asg" {
 
   ami_id        = data.aws_ami.amazon_linux.id
   instance_type = var.instance_type
-  ssh_pub_key   = var.ssh_pub_key
   zone_name     = local.zone_name
 
   cert_pem       = var.cert_pem

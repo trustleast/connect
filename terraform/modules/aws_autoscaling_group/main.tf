@@ -34,7 +34,6 @@ locals {
   user_data = base64encode(templatefile("${path.module}/userdata.sh.tftpl", {
     source_hash   = local.source_hash
     binary_s3_uri = local.binary_s3_uri
-    ssh_pub_key   = var.ssh_pub_key
     region        = data.aws_region.current.region
     args = join(" ", [
       "-config-s3", "s3://${aws_s3_bucket.config.bucket}/config.json",
@@ -145,13 +144,6 @@ data "cloudflare_ip_ranges" "ip_ranges" {}
 resource "aws_security_group" "instance" {
   name   = "${var.name}-${var.stage}"
   vpc_id = var.vpc_id
-
-  ingress {
-    from_port        = 22
-    to_port          = 22
-    protocol         = "tcp"
-    ipv6_cidr_blocks = ["::/0"]
-  }
 
   # Accept signaling traffic from Cloudflare proxy IPs only.
   ingress {

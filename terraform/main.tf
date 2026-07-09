@@ -35,12 +35,6 @@ provider "aws" {
   region   = each.key
 }
 
-locals {
-  # zone_name is the registrable domain derived from the full signaling domain.
-  # e.g. "connect.example.com" → "example.com"
-  zone_name = join(".", slice(split(".", var.domain), 1, length(split(".", var.domain))))
-}
-
 # ACME account key — generated once and stored in state. Used to authenticate
 # all certificate operations against Let's Encrypt.
 resource "tls_private_key" "acme_account" {
@@ -53,11 +47,11 @@ resource "acme_registration" "reg" {
   email_address   = var.acme_email
 }
 
-# Wildcard certificate covering all node subdomains (node-{hash}.{zone_name}).
+# Certificate for the exact serving domain.
 # Renewed automatically on the next `terraform apply` when fewer than 30 days remain.
 resource "acme_certificate" "cert" {
   account_key_pem           = acme_registration.reg.account_key_pem
-  common_name               = "*.${local.zone_name}"
+  common_name               = var.domain
   subject_alternative_names = []
 
   dns_challenge {
@@ -77,7 +71,6 @@ module "region" {
 
   stage         = var.stage
   instance_type = var.instance_type
-  ssh_pub_key   = var.ssh_pub_key
 
   cloudflare_zone_id   = var.cloudflare_zone_id
   cloudflare_api_token = var.cloudflare_api_token
