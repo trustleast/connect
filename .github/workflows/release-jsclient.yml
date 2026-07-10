@@ -49,4 +49,4 @@ jobs:
       - name: Publish to npm
         if: steps.check.outputs.changed == 'true'
         working-directory: jsclient
-        run: npm publish --provenance
+        run: npm publish --provenance --tag next
