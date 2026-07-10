@@ -1,0 +1,52 @@
+name: Build and Release JS Client
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "jsclient/package.json"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check version changed
+        id: check
+        run: |
+          PREV=$(git show HEAD^:jsclient/package.json | jq -r '.version')
+          CURR=$(jq -r '.version' jsclient/package.json)
+          echo "changed=$([ "$PREV" != "$CURR" ] && echo true || echo false)" >> $GITHUB_OUTPUT
+
+      - name: Set up Node
+        if: steps.check.outputs.changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: jsclient/package-lock.json
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install Dependencies
+        if: steps.check.outputs.changed == 'true'
+        working-directory: jsclient
+        run: npm ci
+
+      - name: Build
+        if: steps.check.outputs.changed == 'true'
+        working-directory: jsclient
+        run: npm run build
+
+      - name: Publish to npm
+        if: steps.check.outputs.changed == 'true'
+        working-directory: jsclient
+        run: npm publish --provenance

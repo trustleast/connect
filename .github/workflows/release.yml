@@ -54,11 +54,10 @@ jobs:
           path: release-artifacts
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: goclient-${{ github.sha }}
-          name: goclient ${{ github.sha }}
-          files: release-artifacts/*
-          generate_release_notes: true
+        run: |
+          gh release create "goclient-${{ github.sha }}" \
+            --title "goclient ${{ github.sha }}" \
+            --generate-notes \
+            release-artifacts/*
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
