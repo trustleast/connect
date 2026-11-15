@@ -102,29 +102,32 @@ resource "aws_iam_role" "instance" {
   name               = "${var.name}-${var.stage}"
   path               = "/"
   assume_role_policy = data.aws_iam_policy_document.instance_assume_role.json
+}
 
-  inline_policy {
-    name = "instance_permissions"
+# Same name as the former inline_policy block, so apply adopts the existing
+# inline policy in place rather than creating a second one.
+resource "aws_iam_role_policy" "instance_permissions" {
+  name = "instance_permissions"
+  role = aws_iam_role.instance.id
 
-    policy = jsonencode({
-      Version = "2012-10-17"
-      Statement = [
-        {
-          Effect   = "Allow"
-          Action   = ["ec2:DescribeInstances"]
-          Resource = "*"
-        },
-        {
-          Effect = "Allow"
-          Action = ["s3:GetObject"]
-          Resource = [
-            "${aws_s3_bucket.config.arn}/connect-arm64",
-            "${aws_s3_bucket.config.arn}/config.json",
-          ]
-        },
-      ]
-    })
-  }
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["ec2:DescribeInstances"]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = ["s3:GetObject"]
+        Resource = [
+          "${aws_s3_bucket.config.arn}/connect-arm64",
+          "${aws_s3_bucket.config.arn}/config.json",
+        ]
+      },
+    ]
+  })
 }
 
 resource "aws_iam_instance_profile" "instance" {
